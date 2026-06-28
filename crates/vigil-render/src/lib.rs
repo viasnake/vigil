@@ -277,10 +277,10 @@ mod tests {
     #[test]
     fn renders_readable_markdown() {
         let markdown = render_markdown(&brief());
-        assert!(markdown.contains("# Investigation Brief: web"));
-        assert!(markdown.contains("## Observed Evidence"));
-        assert!(markdown.contains("## Recommended Read-Only Checks"));
-        assert!(markdown.contains("Not executed by Vigil"));
+        assert_eq!(
+            markdown,
+            include_str!("../tests/fixtures/evidence_brief.md")
+        );
     }
 
     #[test]

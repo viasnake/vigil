@@ -2,7 +2,7 @@
 
 Vigil is a Rust CLI for producing evidence-backed SRE investigation briefs from structured local inputs.
 
-The implemented 1.0 workflow reads alert, inventory, and runbook files, builds a redacted evidence packet, asks Cloudflare AI Gateway for structured reasoning, validates the response, and renders Markdown, JSON, and trajectory output.
+The current implementation reads alert, inventory, and runbook files, builds a redacted evidence packet, asks Cloudflare AI Gateway for structured reasoning, validates the response, and renders Markdown, JSON, and trajectory output.
 
 ## Quick Start
 

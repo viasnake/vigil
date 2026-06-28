@@ -29,6 +29,32 @@ fn version_command_works() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn validate_minimal_example_works() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root();
+    let output = Command::new(env!("CARGO_BIN_EXE_vigil"))
+        .current_dir(&root)
+        .args([
+            "validate",
+            "--alert",
+            "examples/minimal/alert.yaml",
+            "--inventory",
+            "examples/minimal/inventory.yaml",
+            "--runbook-dir",
+            "examples/minimal/runbooks",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8(output.stderr)?
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("input validation ok"));
+    Ok(())
+}
+
+#[test]
 fn investigate_minimal_example_no_llm_writes_outputs() -> Result<(), Box<dyn std::error::Error>> {
     let root = workspace_root();
     let out_dir = unique_output_dir()?;

@@ -286,7 +286,7 @@ Given a service or host target, generate an operational investigation brief.
 Example:
 
 ```bash
-vigil investigate target service:web --inventory inventory.yaml
+vigil investigate service:web --inventory inventory.yaml
 ```
 
 The result should answer:
