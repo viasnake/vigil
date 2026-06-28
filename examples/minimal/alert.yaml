@@ -1,0 +1,15 @@
+id: web-5xx-rate
+name: WebHigh5xxRate
+severity: page
+status: firing
+summary: Web service 5xx responses are above the paging threshold.
+description: The web service is returning elevated 5xx responses for production traffic.
+target: service:web
+started_at: "2026-06-29T00:00:00Z"
+labels:
+  service: web
+  environment: production
+annotations:
+  dashboard: web-service-overview
+  runbook_hint: web-5xx
+source: example

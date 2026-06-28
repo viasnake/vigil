@@ -1,0 +1,21 @@
+id: web-5xx
+title: Web 5xx investigation
+applies_to:
+  - service:web
+symptoms:
+  - elevated 5xx responses
+  - frontend error spike
+checks:
+  - id: confirm-scope
+    title: Review service-level error and latency dashboards
+    description: Compare web error rate, latency, saturation, and request volume during the alert window.
+    read_only: true
+  - id: review-recent-changes
+    title: Review recent deploy and configuration records
+    description: Compare recent deploys and configuration changes with the alert start time.
+    read_only: true
+notes:
+  - Keep hypotheses separate from observed evidence.
+references:
+  - title: Web service dashboard
+    path: dashboards/web-service-overview

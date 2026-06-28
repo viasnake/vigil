@@ -1,0 +1,17 @@
+targets:
+  - id: service:web
+    kind: service
+    name: web
+    environment: production
+    service: web
+    criticality: high
+    labels:
+      tier: frontend
+      team: sre
+    metadata:
+      dashboard: web-service-overview
+
+dependencies:
+  - from: service:web
+    to: service:api
+    relation: calls
