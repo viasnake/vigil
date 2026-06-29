@@ -34,10 +34,13 @@ Concise implementation knowledge discovered while building Vigil.
 * Manual ambiguous-input check passed: `vigil investigate /tmp/web-5xx --inventory examples/minimal/inventory.yaml --no-llm` failed with an actionable ambiguity error.
 * Temporary live Cloudflare validation on 2026-06-29 did not produce an LLM response: `vigil investigate /tmp/web-5xx` against the REST endpoint returned HTTP 401, and a direct minimal REST request returned the same authentication error.
 * A provider-native `gateway.ai.cloudflare.com` diagnostic using Gateway authentication reached Cloudflare AI Gateway but returned HTTP 402 `Insufficient wholesale credits`; live end-to-end LLM output remains unvalidated.
+* Workers AI lightweight model validation on 2026-06-29 used `@cf/meta/llama-3.2-1b-instruct`: direct Workers AI REST, AI Gateway REST, and `vigil investigate /tmp/web-5xx` all returned HTTP 401 with the temporary token.
+* The same Workers AI model returned HTTP 200 for a simple prompt through `gateway.ai.cloudflare.com/.../workers-ai/v1/chat/completions` with Gateway authentication, confirming the model/gateway path works but not through Vigil's current REST implementation with that token.
 
 ## Known Limitations
 
 * Real Cloudflare requests were attempted with temporary credentials, but no successful LLM response was received because the REST request failed authentication and the provider-native diagnostic hit account credits.
+* The temporary token behaves as a provider-native Gateway authentication token; Vigil currently expects the REST API path with a Cloudflare API token accepted by `api.cloudflare.com`.
 * Redaction is intentionally basic and cannot guarantee perfect secret detection.
 * File inputs cover alert, inventory, and runbook evidence; there are no log, metric, change, ticketing, or monitoring adapters.
 
