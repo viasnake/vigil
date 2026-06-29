@@ -10,10 +10,10 @@ use thiserror::Error;
 use uuid::Uuid;
 use vigil_llm::{LlmError, LlmProvider, ProviderResponse};
 use vigil_model::{
-    validate_reasoning_result, Alert, Evidence, EvidenceBrief, EvidenceKind, EvidencePacket,
-    EvidenceSource, Hypothesis, Inventory, InvestigationConstraints, LlmExchangeMetadata,
-    MissingCheck, ReasoningResult, RecommendedCheck, RedactionReport, Runbook, SourceReference,
-    Target, TargetKind, Trajectory, TrajectoryInputs,
+    validate_reasoning_result, Alert, CaseManifest, Evidence, EvidenceBrief, EvidenceKind,
+    EvidencePacket, EvidenceSource, Hypothesis, Inventory, InvestigationConstraints,
+    LlmExchangeMetadata, MissingCheck, ReasoningResult, RecommendedCheck, RedactionReport, Runbook,
+    SourceReference, Target, TargetKind, Trajectory, TrajectoryInputs,
 };
 
 #[derive(Debug, Error)]
@@ -47,8 +47,43 @@ pub enum CoreError {
         path: String,
         source: std::io::Error,
     },
+    #[error("{kind} directory '{path}' could not be read: {source}")]
+    ReadDirectory {
+        kind: &'static str,
+        path: String,
+        source: std::io::Error,
+    },
     #[error("runbook directory '{path}' is not a directory")]
     RunbookDirNotDirectory { path: String },
+    #[error("case directory '{path}' already exists. Use --force to overwrite the manifest.")]
+    CaseAlreadyExists { path: String },
+    #[error("case directory '{path}' does not contain vigil.yaml. Run 'vigil case init' first.")]
+    MissingCaseManifest { path: String },
+    #[error("case directory '{path}' is missing required subdirectory '{subdir}'")]
+    MissingCaseSubdir { path: String, subdir: &'static str },
+    #[error("case path '{path}' exists but is not a directory")]
+    CasePathNotDirectory { path: String },
+    #[error("case file '{path}' could not be written: {source}")]
+    WriteCaseFile {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("case directory '{path}' could not be created: {source}")]
+    CreateCaseDir {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("runbook '{source_path}' could not be copied to '{destination}': {error}")]
+    CopyRunbook {
+        source_path: String,
+        destination: String,
+        error: String,
+    },
+    #[error("YAML could not be generated for {kind}: {source}")]
+    SerializeYaml {
+        kind: &'static str,
+        source: serde_yaml::Error,
+    },
     #[error("investigation requires a provider unless --no-llm or --dry-run is used")]
     MissingProvider,
     #[error("LLM provider failed: {0}")]
@@ -82,6 +117,52 @@ pub struct ValidationRequest {
 pub struct InvestigationOutcome {
     pub brief: EvidenceBrief,
     pub trajectory: Trajectory,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseInitRequest {
+    pub case_dir: PathBuf,
+    pub target: String,
+    pub severity: String,
+    pub summary: String,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvidenceAddRequest {
+    pub case_dir: PathBuf,
+    pub kind: EvidenceKind,
+    pub summary: String,
+    pub source: String,
+    pub url: Option<String>,
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangeAddRequest {
+    pub case_dir: PathBuf,
+    pub summary: String,
+    pub source: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunbookAddRequest {
+    pub case_dir: PathBuf,
+    pub runbook_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseInvestigationRequest {
+    pub case_dir: PathBuf,
+    pub no_llm: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddedEvidence {
+    pub path: PathBuf,
+    pub evidence: Evidence,
 }
 
 pub async fn investigate(
@@ -146,6 +227,7 @@ pub async fn investigate(
         started_at,
         completed_at,
         inputs: TrajectoryInputs {
+            case_dir: None,
             alert: request.alert_path.as_deref().map(display_path),
             inventory: Some(display_path(&request.inventory_path)),
             runbooks: request
@@ -157,6 +239,196 @@ pub async fn investigate(
             target: request.target.clone(),
         },
         resolved_targets,
+        evidence_packet: packet,
+        reasoning_result: Some(reasoning_result),
+        brief: brief.clone(),
+        llm: llm_metadata,
+        warnings,
+        errors: Vec::new(),
+    };
+
+    Ok(InvestigationOutcome { brief, trajectory })
+}
+
+pub fn init_case(request: CaseInitRequest) -> Result<CaseManifest, CoreError> {
+    if request.case_dir.exists() {
+        if !request.force {
+            return Err(CoreError::CaseAlreadyExists {
+                path: request.case_dir.display().to_string(),
+            });
+        }
+        if !request.case_dir.is_dir() {
+            return Err(CoreError::CasePathNotDirectory {
+                path: request.case_dir.display().to_string(),
+            });
+        }
+    }
+
+    create_case_subdir(&request.case_dir)?;
+    create_case_subdir(&request.case_dir.join("evidence"))?;
+    create_case_subdir(&request.case_dir.join("runbooks"))?;
+    create_case_subdir(&request.case_dir.join("output"))?;
+
+    let id = case_id_from_dir(&request.case_dir);
+    let manifest = CaseManifest {
+        title: case_title_from_id(&id),
+        id,
+        severity: request.severity,
+        status: "investigating".to_string(),
+        target: request.target,
+        summary: request.summary,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    validate_case_manifest(&manifest, &request.case_dir)?;
+    write_yaml_file(
+        &case_manifest_path(&request.case_dir),
+        &manifest,
+        "case manifest",
+    )?;
+    Ok(manifest)
+}
+
+pub fn load_case_manifest(case_dir: &Path) -> Result<CaseManifest, CoreError> {
+    let path = case_manifest_path(case_dir);
+    if !path.exists() {
+        return Err(CoreError::MissingCaseManifest {
+            path: case_dir.display().to_string(),
+        });
+    }
+    let manifest: CaseManifest = parse_document("case manifest", &path)?;
+    validate_case_manifest(&manifest, &path)?;
+    Ok(manifest)
+}
+
+pub fn add_case_evidence(request: EvidenceAddRequest) -> Result<AddedEvidence, CoreError> {
+    let manifest = load_case_manifest(&request.case_dir)?;
+    let evidence_dir = required_case_subdir(&request.case_dir, "evidence")?;
+    let evidence_path = next_case_evidence_path(&evidence_dir, &request.kind)?;
+    let evidence = build_case_evidence_item(
+        &manifest,
+        request.kind,
+        evidence_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("evidence"),
+        &request.summary,
+        &request.source,
+        request.url.as_deref(),
+        request.file.as_deref(),
+    )?;
+    validate_evidence(&evidence, &evidence_path)?;
+    write_yaml_file(&evidence_path, &evidence, "case evidence")?;
+    Ok(AddedEvidence {
+        path: evidence_path,
+        evidence,
+    })
+}
+
+pub fn add_case_change(request: ChangeAddRequest) -> Result<AddedEvidence, CoreError> {
+    add_case_evidence(EvidenceAddRequest {
+        case_dir: request.case_dir,
+        kind: EvidenceKind::Change,
+        summary: request.summary,
+        source: request.source,
+        url: request.url,
+        file: None,
+    })
+}
+
+pub fn add_case_runbook(request: RunbookAddRequest) -> Result<PathBuf, CoreError> {
+    let _manifest = load_case_manifest(&request.case_dir)?;
+    let runbook = load_runbook(&request.runbook_path)?;
+    let runbook_dir = required_case_subdir(&request.case_dir, "runbooks")?;
+    let file_name = request
+        .runbook_path
+        .file_name()
+        .ok_or_else(|| CoreError::Validation {
+            kind: "runbook",
+            path: request.runbook_path.display().to_string(),
+            errors: "runbook path must include a file name".to_string(),
+        })?;
+    let destination = runbook_dir.join(file_name);
+    if request.runbook_path != destination {
+        fs::copy(&request.runbook_path, &destination).map_err(|err| CoreError::CopyRunbook {
+            source_path: request.runbook_path.display().to_string(),
+            destination: destination.display().to_string(),
+            error: err.to_string(),
+        })?;
+    }
+    let _validated = runbook;
+    Ok(destination)
+}
+
+pub async fn investigate_case(
+    request: CaseInvestigationRequest,
+    provider: Option<&dyn LlmProvider>,
+) -> Result<InvestigationOutcome, CoreError> {
+    let started_at = Utc::now().to_rfc3339();
+    let investigation_id = Uuid::now_v7().to_string();
+    let manifest = load_case_manifest(&request.case_dir)?;
+    let evidence_dir = required_case_subdir(&request.case_dir, "evidence")?;
+    let runbook_dir = required_case_subdir(&request.case_dir, "runbooks")?;
+    let supplied_evidence = load_case_evidence_dir(&evidence_dir)?;
+    let runbook_paths = supported_document_paths("runbook", &runbook_dir)?;
+    let runbooks = load_runbooks(&runbook_paths, None)?;
+    let target = target_from_case_manifest(&manifest);
+    let alert = alert_from_case_manifest(&manifest);
+    let evidence = build_case_evidence(&manifest, &alert, &target, supplied_evidence, &runbooks)?;
+    let question = format!("Investigate case '{}': {}", manifest.id, manifest.summary);
+
+    let packet = EvidencePacket {
+        investigation_id: investigation_id.clone(),
+        question,
+        targets: vec![target.clone()],
+        alerts: vec![alert],
+        evidence,
+        runbooks: matching_runbooks(&runbooks, std::slice::from_ref(&target)),
+        constraints: InvestigationConstraints::default(),
+        redaction: RedactionReport::default(),
+        metadata: BTreeMap::from([
+            ("tool".to_string(), Value::String("vigil".to_string())),
+            ("mode".to_string(), Value::String("case".to_string())),
+            ("case_id".to_string(), Value::String(manifest.id.clone())),
+        ]),
+    };
+    let packet = redact_evidence_packet(packet)?;
+
+    let mut warnings = packet.redaction.warnings.clone();
+    if request.no_llm {
+        warnings.push(
+            "--no-llm was used; reasoning is deterministic and not LLM-assisted.".to_string(),
+        );
+    }
+    if request.dry_run {
+        warnings.push("--dry-run was used; no LLM request was sent.".to_string());
+    }
+
+    let (reasoning_result, llm_metadata) = if request.no_llm || request.dry_run {
+        (deterministic_reasoning(&packet)?, None)
+    } else {
+        let provider = provider.ok_or(CoreError::MissingProvider)?;
+        let response = provider.reason(&packet).await?;
+        provider_response_parts(response)
+    };
+
+    let brief = build_brief(&packet, &reasoning_result, &warnings);
+    let completed_at = Utc::now().to_rfc3339();
+    let trajectory = Trajectory {
+        id: investigation_id,
+        started_at,
+        completed_at,
+        inputs: TrajectoryInputs {
+            case_dir: Some(display_path(&request.case_dir)),
+            alert: None,
+            inventory: None,
+            runbooks: runbook_paths
+                .iter()
+                .map(|path| display_path(path))
+                .collect(),
+            runbook_dir: Some(display_path(&runbook_dir)),
+            target: Some(manifest.target),
+        },
+        resolved_targets: vec![target],
         evidence_packet: packet,
         reasoning_result: Some(reasoning_result),
         brief: brief.clone(),
@@ -264,6 +536,325 @@ pub fn load_runbooks(
         .iter()
         .map(|path| load_runbook(path))
         .collect::<Result<Vec<_>, _>>()
+}
+
+pub fn load_case_evidence(path: &Path) -> Result<Evidence, CoreError> {
+    let evidence: Evidence = parse_document("evidence", path)?;
+    validate_evidence(&evidence, path)?;
+    Ok(evidence)
+}
+
+fn load_case_evidence_dir(evidence_dir: &Path) -> Result<Vec<Evidence>, CoreError> {
+    supported_document_paths("evidence", evidence_dir)?
+        .iter()
+        .map(|path| load_case_evidence(path))
+        .collect()
+}
+
+fn supported_document_paths(kind: &'static str, dir: &Path) -> Result<Vec<PathBuf>, CoreError> {
+    let entries = fs::read_dir(dir).map_err(|source| CoreError::ReadDirectory {
+        kind,
+        path: dir.display().to_string(),
+        source,
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| CoreError::ReadDirectory {
+            kind,
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let path = entry.path();
+        if is_supported_document(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn case_manifest_path(case_dir: &Path) -> PathBuf {
+    case_dir.join("vigil.yaml")
+}
+
+fn case_id_from_dir(case_dir: &Path) -> String {
+    case_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("case")
+        .to_string()
+}
+
+fn case_title_from_id(id: &str) -> String {
+    let words = id
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    format!("{} investigation", words.join(" "))
+}
+
+fn create_case_subdir(path: &Path) -> Result<(), CoreError> {
+    fs::create_dir_all(path).map_err(|source| CoreError::CreateCaseDir {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn required_case_subdir(case_dir: &Path, subdir: &'static str) -> Result<PathBuf, CoreError> {
+    let path = case_dir.join(subdir);
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(CoreError::MissingCaseSubdir {
+            path: case_dir.display().to_string(),
+            subdir,
+        })
+    }
+}
+
+fn validate_case_manifest(manifest: &CaseManifest, path: &Path) -> Result<(), CoreError> {
+    let errors = manifest.validate();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CoreError::Validation {
+            kind: "case manifest",
+            path: path.display().to_string(),
+            errors: errors.join("; "),
+        })
+    }
+}
+
+fn validate_evidence(evidence: &Evidence, path: &Path) -> Result<(), CoreError> {
+    let errors = evidence.validate();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CoreError::Validation {
+            kind: "evidence",
+            path: path.display().to_string(),
+            errors: errors.join("; "),
+        })
+    }
+}
+
+fn write_yaml_file<T>(path: &Path, value: &T, kind: &'static str) -> Result<(), CoreError>
+where
+    T: serde::Serialize,
+{
+    let yaml =
+        serde_yaml::to_string(value).map_err(|source| CoreError::SerializeYaml { kind, source })?;
+    fs::write(path, yaml).map_err(|source| CoreError::WriteCaseFile {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn next_case_evidence_path(evidence_dir: &Path, kind: &EvidenceKind) -> Result<PathBuf, CoreError> {
+    let prefix = kind.file_prefix();
+    for index in 1..=9999 {
+        let path = evidence_dir.join(format!("{prefix}-{index:03}.yaml"));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(CoreError::Validation {
+        kind: "evidence",
+        path: evidence_dir.display().to_string(),
+        errors: format!("could not allocate a new {prefix} evidence file name"),
+    })
+}
+
+fn build_case_evidence_item(
+    manifest: &CaseManifest,
+    kind: EvidenceKind,
+    id: &str,
+    summary: &str,
+    source: &str,
+    url: Option<&str>,
+    file: Option<&Path>,
+) -> Result<Evidence, CoreError> {
+    let mut references = Vec::new();
+    let mut data = serde_json::Map::new();
+    data.insert("source".to_string(), Value::String(source.to_string()));
+
+    if let Some(url) = url {
+        data.insert("url".to_string(), Value::String(url.to_string()));
+        references.push(SourceReference {
+            title: Some(source.to_string()),
+            url: Some(url.to_string()),
+            path: None,
+        });
+    }
+
+    if let Some(file) = file {
+        let content = read_to_string("evidence source", file)?;
+        data.insert(
+            "file".to_string(),
+            json!({
+                "path": file.display().to_string(),
+                "content": content
+            }),
+        );
+        references.push(SourceReference {
+            title: Some(source.to_string()),
+            url: None,
+            path: Some(file.display().to_string()),
+        });
+    }
+
+    Ok(Evidence {
+        id: id.to_string(),
+        kind,
+        summary: summary.to_string(),
+        source: EvidenceSource {
+            kind: "case_input".to_string(),
+            name: source.to_string(),
+            path: None,
+        },
+        target: Some(manifest.target.clone()),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 1.0,
+        data: Value::Object(data),
+        references,
+    })
+}
+
+fn target_from_case_manifest(manifest: &CaseManifest) -> Target {
+    let (kind, name) = manifest
+        .target
+        .split_once(':')
+        .map(|(kind, name)| (target_kind_from_label(kind), name.to_string()))
+        .unwrap_or((TargetKind::Unknown, manifest.target.clone()));
+
+    Target {
+        id: manifest.target.clone(),
+        kind,
+        name,
+        environment: None,
+        service: None,
+        host: None,
+        labels: BTreeMap::new(),
+        criticality: Some(manifest.severity.clone()),
+        metadata: BTreeMap::from([
+            ("case_id".to_string(), Value::String(manifest.id.clone())),
+            (
+                "case_status".to_string(),
+                Value::String(manifest.status.clone()),
+            ),
+        ]),
+    }
+}
+
+fn target_kind_from_label(kind: &str) -> TargetKind {
+    match kind {
+        "service" => TargetKind::Service,
+        "host" => TargetKind::Host,
+        "component" => TargetKind::Component,
+        "endpoint" => TargetKind::Endpoint,
+        _ => TargetKind::Unknown,
+    }
+}
+
+fn alert_from_case_manifest(manifest: &CaseManifest) -> Alert {
+    Alert {
+        id: manifest.id.clone(),
+        name: manifest.title.clone(),
+        severity: manifest.severity.clone(),
+        status: manifest.status.clone(),
+        summary: manifest.summary.clone(),
+        description: None,
+        target: Some(manifest.target.clone()),
+        started_at: Some(manifest.created_at.clone()),
+        ended_at: None,
+        labels: BTreeMap::new(),
+        annotations: BTreeMap::from([("case_id".to_string(), Value::String(manifest.id.clone()))]),
+        source: Some("case_manifest".to_string()),
+    }
+}
+
+fn build_case_evidence(
+    manifest: &CaseManifest,
+    alert: &Alert,
+    target: &Target,
+    supplied_evidence: Vec<Evidence>,
+    runbooks: &[Runbook],
+) -> Result<Vec<Evidence>, CoreError> {
+    let mut evidence = vec![
+        Evidence {
+            id: format!("case:{}", manifest.id),
+            kind: EvidenceKind::Alert,
+            summary: manifest.summary.clone(),
+            source: EvidenceSource {
+                kind: "case_manifest".to_string(),
+                name: manifest.id.clone(),
+                path: Some("vigil.yaml".to_string()),
+            },
+            target: Some(manifest.target.clone()),
+            timestamp: Some(manifest.created_at.clone()),
+            confidence: 1.0,
+            data: serde_json::to_value(alert)
+                .map_err(|err| CoreError::Redaction(err.to_string()))?,
+            references: Vec::new(),
+        },
+        Evidence {
+            id: format!("target:{}", target.id),
+            kind: EvidenceKind::Inventory,
+            summary: format!(
+                "Case manifest identifies '{}' as the investigation target.",
+                target.id
+            ),
+            source: EvidenceSource {
+                kind: "case_manifest".to_string(),
+                name: manifest.id.clone(),
+                path: Some("vigil.yaml".to_string()),
+            },
+            target: Some(target.id.clone()),
+            timestamp: Some(manifest.created_at.clone()),
+            confidence: 1.0,
+            data: serde_json::to_value(target)
+                .map_err(|err| CoreError::Redaction(err.to_string()))?,
+            references: Vec::new(),
+        },
+    ];
+    evidence.extend(supplied_evidence);
+
+    for runbook in matching_runbooks(runbooks, std::slice::from_ref(target)) {
+        evidence.push(Evidence {
+            id: format!("runbook:{}", runbook.id),
+            kind: EvidenceKind::Runbook,
+            summary: format!(
+                "Runbook '{}' supplies {} read-only check(s).",
+                runbook.title,
+                runbook.checks.len()
+            ),
+            source: EvidenceSource {
+                kind: "case_runbook".to_string(),
+                name: runbook.id.clone(),
+                path: Some(format!("runbooks/{}.yaml", runbook.id)),
+            },
+            target: Some(target.id.clone()),
+            timestamp: None,
+            confidence: 0.9,
+            data: serde_json::to_value(&runbook)
+                .map_err(|err| CoreError::Redaction(err.to_string()))?,
+            references: runbook.references.clone(),
+        });
+    }
+
+    for item in &evidence {
+        validate_evidence(item, Path::new("generated"))?;
+    }
+
+    Ok(evidence)
 }
 
 pub fn redact_evidence_packet(packet: EvidencePacket) -> Result<EvidencePacket, CoreError> {
@@ -1058,6 +1649,108 @@ checks:
                 .map(|metadata| metadata.provider.as_str()),
             Some("mock")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn case_init_refuses_existing_without_force() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let case_dir = temp.path().join("web-5xx");
+        let request = CaseInitRequest {
+            case_dir: case_dir.clone(),
+            target: "service:web".to_string(),
+            severity: "page".to_string(),
+            summary: "Web 5xx responses are above threshold.".to_string(),
+            force: false,
+        };
+
+        let manifest = init_case(request.clone())?;
+        assert_eq!(manifest.id, "web-5xx");
+        assert!(case_dir.join("vigil.yaml").is_file());
+        assert!(case_dir.join("evidence").is_dir());
+        assert!(case_dir.join("runbooks").is_dir());
+        assert!(case_dir.join("output").is_dir());
+
+        let error = init_case(request).err();
+        assert!(matches!(error, Some(CoreError::CaseAlreadyExists { .. })));
+
+        let overwritten = init_case(CaseInitRequest {
+            force: true,
+            case_dir,
+            target: "service:web".to_string(),
+            severity: "page".to_string(),
+            summary: "Updated summary.".to_string(),
+        })?;
+        assert_eq!(overwritten.summary, "Updated summary.");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn case_workflow_intakes_evidence_and_investigates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (_inventory_path, _alert_path, runbook_path) = write_example_inputs(temp.path())?;
+        let case_dir = temp.path().join("web-5xx");
+
+        init_case(CaseInitRequest {
+            case_dir: case_dir.clone(),
+            target: "service:web".to_string(),
+            severity: "page".to_string(),
+            summary: "Web service 5xx responses are above threshold.".to_string(),
+            force: false,
+        })?;
+
+        let metric = add_case_evidence(EvidenceAddRequest {
+            case_dir: case_dir.clone(),
+            kind: EvidenceKind::Metric,
+            summary: "HTTP 5xx rate increased from 0.2% to 8.4%.".to_string(),
+            source: "prometheus".to_string(),
+            url: Some("https://grafana.example.com/d/web".to_string()),
+            file: None,
+        })?;
+        assert_eq!(
+            metric.path.file_name().and_then(|name| name.to_str()),
+            Some("metric-001.yaml")
+        );
+        assert_eq!(load_case_evidence(&metric.path)?.kind, EvidenceKind::Metric);
+
+        let change = add_case_change(ChangeAddRequest {
+            case_dir: case_dir.clone(),
+            summary: "Caddy upstream timeout setting changed before the alert.".to_string(),
+            source: "github".to_string(),
+            url: Some("https://github.com/example/repo/pull/123".to_string()),
+        })?;
+        assert_eq!(load_case_evidence(&change.path)?.kind, EvidenceKind::Change);
+
+        let copied_runbook = add_case_runbook(RunbookAddRequest {
+            case_dir: case_dir.clone(),
+            runbook_path,
+        })?;
+        assert!(copied_runbook.is_file());
+
+        let outcome = investigate_case(
+            CaseInvestigationRequest {
+                case_dir: case_dir.clone(),
+                no_llm: true,
+                dry_run: false,
+            },
+            None,
+        )
+        .await?;
+
+        assert!(outcome.brief.summary.contains("Deterministic"));
+        let expected_case_dir = case_dir.display().to_string();
+        assert_eq!(
+            outcome.trajectory.inputs.case_dir.as_deref(),
+            Some(expected_case_dir.as_str())
+        );
+        assert!(outcome
+            .trajectory
+            .evidence_packet
+            .evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::Change));
+        assert!(outcome.trajectory.evidence_packet.runbooks.len() == 1);
         Ok(())
     }
 }

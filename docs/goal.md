@@ -207,14 +207,28 @@ User-facing docs must describe the actual implementation.
 
 Vigil 1.0 must be a reliable Rust CLI that can investigate an operational issue using structured inputs, read-only integrations, and Cloudflare AI Gateway.
 
-At 1.0, a user should be able to run:
+At 1.0, a user should be able to run a case-based investigation:
 
 ```bash
-vigil investigate \
-  --alert examples/minimal/alert.yaml \
-  --inventory examples/minimal/inventory.yaml \
-  --runbook-dir examples/minimal/runbooks \
-  --output brief.md
+vigil case init web-5xx \
+  --target service:web \
+  --severity page \
+  --summary "Web service 5xx responses are above threshold"
+
+vigil evidence add web-5xx \
+  --kind metric \
+  --summary "HTTP 5xx rate increased from 0.2% to 8.4%" \
+  --source prometheus \
+  --url "https://grafana.example.com/d/web"
+
+vigil change add web-5xx \
+  --summary "Caddy upstream timeout setting changed before the alert" \
+  --source github \
+  --url "https://github.com/example/repo/pull/123"
+
+vigil runbook add web-5xx examples/minimal/runbooks/web-5xx.yaml
+
+vigil investigate web-5xx
 ```
 
 and receive a useful investigation brief containing:
@@ -229,6 +243,8 @@ and receive a useful investigation brief containing:
 * source references,
 * structured JSON output,
 * and a trajectory record suitable for later review.
+
+The existing file-based workflow remains supported for scripting and tests.
 
 Vigil 1.0 must be useful for a real SRE investigation without executing production actions.
 
@@ -484,7 +500,7 @@ Recommended checks are not executed by Vigil 1.0.
 The 1.0 investigation workflow is:
 
 ```text
-Input files / read-only adapters
+Case manifest / case evidence / file inputs / read-only adapters
         ↓
 Target resolution
         ↓
@@ -746,11 +762,67 @@ vigil
 
 ### Required Commands for 1.0
 
+#### `vigil case init`
+
+Creates a local investigation case.
+
+Example:
+
+```bash
+vigil case init web-5xx \
+  --target service:web \
+  --severity page \
+  --summary "Web service 5xx responses are above threshold"
+```
+
+#### `vigil evidence add`
+
+Adds structured evidence to a case.
+
+Example:
+
+```bash
+vigil evidence add web-5xx \
+  --kind metric \
+  --summary "HTTP 5xx rate increased from 0.2% to 8.4%" \
+  --source prometheus \
+  --url "https://grafana.example.com/d/web"
+```
+
+#### `vigil change add`
+
+Adds change evidence to a case.
+
+Example:
+
+```bash
+vigil change add web-5xx \
+  --summary "Caddy upstream timeout setting changed before the alert" \
+  --source github \
+  --url "https://github.com/example/repo/pull/123"
+```
+
+#### `vigil runbook add`
+
+Validates and copies a runbook into a case.
+
+Example:
+
+```bash
+vigil runbook add web-5xx examples/minimal/runbooks/web-5xx.yaml
+```
+
 #### `vigil investigate`
 
 Main command.
 
-Required behavior:
+Primary case behavior:
+
+```bash
+vigil investigate web-5xx
+```
+
+Required file-based compatibility behavior:
 
 ```bash
 vigil investigate \
@@ -775,6 +847,7 @@ Options:
 --gateway-id <GATEWAY_ID>
 --dry-run
 --no-llm
+<CASE_DIR_OR_TARGET>
 ```
 
 `--no-llm` exists only for testing and deterministic rendering. It is not the primary assistant experience.
@@ -821,6 +894,8 @@ Vigil 1.0 must support YAML and JSON input where practical.
 Required input categories:
 
 ```text
+case manifest
+case evidence
 inventory
 alert
 runbook
@@ -849,6 +924,8 @@ Markdown brief
 JSON brief
 JSON trajectory
 ```
+
+Case investigation writes these outputs under `<case>/output/` by default.
 
 The Markdown brief must be readable without any external UI.
 
@@ -1225,7 +1302,8 @@ Deliver:
 
 * stable Rust CLI,
 * Cloudflare AI Gateway provider,
-* file-based input workflow,
+* case-based input workflow,
+* file-based input workflow for compatibility,
 * LLM-assisted investigation brief,
 * schema-validated reasoning output,
 * Markdown and JSON output,
@@ -1239,7 +1317,8 @@ Deliver:
 
 Vigil 1.0 is acceptable only when all of the following are true:
 
-* `vigil investigate` works with the minimal example.
+* `vigil investigate` works with a case directory.
+* `vigil investigate` works with the minimal file-based example.
 * Cloudflare AI Gateway is the only implemented LLM provider.
 * LLM responses are schema-validated.
 * Invalid LLM responses are rejected or handled safely.
@@ -1290,3 +1369,163 @@ It does not execute commands.
 It does not replace SRE judgment.
 
 It provides a reliable foundation for future SRE AI tooling.
+
+## 1.0 UX Contract
+
+Vigil 1.0 must be usable during an actual SRE investigation.
+
+The primary workflow is case-based investigation.
+
+A case is a local investigation workspace that contains the operational question,
+target, supplied evidence, related changes, runbooks, generated brief, and trajectory.
+
+### Primary Workflow
+
+```text
+case init
+  -> evidence add
+  -> change add
+  -> runbook add
+  -> investigate
+  -> review brief
+  -> add more evidence
+  -> investigate again
+```
+
+### Required User Experience
+
+An operator must be able to start from a real alert or symptom without hand-writing a complete EvidencePacket.
+
+The user should be able to:
+
+1. Create an investigation case from a target, alert summary, and severity.
+2. Add metric, log, change, runbook, and operator-observation evidence.
+3. Run LLM-assisted investigation through Cloudflare AI Gateway.
+4. Receive a Markdown brief suitable for incident notes.
+5. Receive JSON output suitable for tooling.
+6. Receive a trajectory suitable for replay, debugging, and future evaluation.
+7. Re-run investigation after adding more evidence.
+8. Do all of the above without production mutation or command execution.
+
+### Required Commands
+
+Vigil 1.0 should provide these user-facing commands:
+
+```text
+vigil case init
+vigil evidence add
+vigil change add
+vigil runbook add
+vigil investigate
+vigil render
+vigil validate
+vigil config check
+vigil version
+```
+
+### Case Directory
+
+A Vigil case directory should look like this:
+
+```text
+web-5xx/
+  vigil.yaml
+  evidence/
+    metric-001.yaml
+    log-001.yaml
+    change-001.yaml
+    operator-note-001.yaml
+  runbooks/
+    web-5xx.yaml
+  output/
+    brief.md
+    brief.json
+    trajectory.json
+```
+
+### Case Manifest
+
+`vigil.yaml` should contain:
+
+```yaml
+id: web-5xx
+title: Web 5xx investigation
+severity: page
+status: investigating
+target: service:web
+summary: Web service 5xx responses are above threshold.
+created_at: "2026-06-29T00:00:00Z"
+```
+
+### Evidence Add UX
+
+Users should not need to manually write full YAML for common evidence.
+
+Examples:
+
+```bash
+vigil evidence add web-5xx \
+  --kind metric \
+  --summary "HTTP 5xx rate increased from 0.2% to 8.4%" \
+  --source prometheus \
+  --url "https://grafana.example.com/d/web"
+```
+
+```bash
+vigil evidence add web-5xx \
+  --kind log \
+  --summary "Backend timeout errors increased around the alert window" \
+  --source loki \
+  --file ./timeout-snippet.txt
+```
+
+```bash
+vigil change add web-5xx \
+  --summary "Caddy upstream timeout setting changed before the alert" \
+  --source github \
+  --url "https://github.com/example/repo/pull/123"
+```
+
+### Investigation UX
+
+Users should be able to run:
+
+```bash
+vigil investigate web-5xx
+```
+
+By default, this should write:
+
+```text
+web-5xx/output/brief.md
+web-5xx/output/brief.json
+web-5xx/output/trajectory.json
+```
+
+Explicit output flags should remain supported.
+
+### Compatibility
+
+The existing file-based workflow should remain available for scripting:
+
+```bash
+vigil investigate \
+  --alert alert.yaml \
+  --inventory inventory.yaml \
+  --runbook-dir runbooks \
+  --output brief.md
+```
+
+However, the case-based workflow is the primary UX for 1.0.
+
+### Non-Goals
+
+The case workflow must not introduce:
+
+* shell command execution,
+* SSH execution,
+* target-host runners,
+* production mutation,
+* autonomous remediation,
+* ChatOps bot behavior,
+* background monitoring.

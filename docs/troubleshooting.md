@@ -22,6 +22,25 @@ vigil validate --alert alert.yaml --inventory inventory.yaml --runbook-dir runbo
 
 The error message includes the input category and file path.
 
+## Existing Case Directory
+
+`vigil case init` refuses to overwrite an existing case directory unless `--force` is supplied.
+
+## Missing Case Manifest
+
+`vigil investigate <case-dir>` expects `<case-dir>/vigil.yaml`. Create the case with `vigil case init` first.
+
+## Ambiguous Investigation Input
+
+Do not combine a case directory with file-mode flags such as `--alert` or `--inventory`.
+
+Use one of these forms:
+
+```bash
+vigil investigate web-5xx
+vigil investigate --alert alert.yaml --inventory inventory.yaml
+```
+
 ## Invalid LLM Response
 
 Vigil rejects model output that is not valid JSON, does not match the `ReasoningResult` schema, is not read-only, or includes obvious runnable shell-command text in recommended checks.

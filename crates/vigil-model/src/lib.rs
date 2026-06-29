@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -98,6 +101,45 @@ impl Alert {
         }
         if self.summary.trim().is_empty() {
             errors.push(format!("alert '{}' summary must not be empty", self.id));
+        }
+        errors
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CaseManifest {
+    pub id: String,
+    pub title: String,
+    pub severity: String,
+    pub status: String,
+    pub target: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
+impl CaseManifest {
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.id.trim().is_empty() {
+            errors.push("case id must not be empty".to_string());
+        }
+        if self.title.trim().is_empty() {
+            errors.push(format!("case '{}' title must not be empty", self.id));
+        }
+        if self.severity.trim().is_empty() {
+            errors.push(format!("case '{}' severity must not be empty", self.id));
+        }
+        if self.status.trim().is_empty() {
+            errors.push(format!("case '{}' status must not be empty", self.id));
+        }
+        if self.target.trim().is_empty() {
+            errors.push(format!("case '{}' target must not be empty", self.id));
+        }
+        if self.summary.trim().is_empty() {
+            errors.push(format!("case '{}' summary must not be empty", self.id));
+        }
+        if self.created_at.trim().is_empty() {
+            errors.push(format!("case '{}' created_at must not be empty", self.id));
         }
         errors
     }
@@ -271,6 +313,48 @@ pub enum EvidenceKind {
     OperatorInput,
     #[default]
     External,
+}
+
+impl EvidenceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Alert => "alert",
+            Self::Metric => "metric",
+            Self::Log => "log",
+            Self::Change => "change",
+            Self::Runbook => "runbook",
+            Self::Inventory => "inventory",
+            Self::OperatorInput => "operator_input",
+            Self::External => "external",
+        }
+    }
+
+    pub fn file_prefix(&self) -> &'static str {
+        match self {
+            Self::OperatorInput => "operator-note",
+            other => other.as_str(),
+        }
+    }
+}
+
+impl FromStr for EvidenceKind {
+    type Err = ModelError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "alert" => Ok(Self::Alert),
+            "metric" => Ok(Self::Metric),
+            "log" => Ok(Self::Log),
+            "change" => Ok(Self::Change),
+            "runbook" => Ok(Self::Runbook),
+            "inventory" => Ok(Self::Inventory),
+            "operator_input" | "operator_note" | "observation" => Ok(Self::OperatorInput),
+            "external" => Ok(Self::External),
+            other => Err(ModelError::SemanticValidation(format!(
+                "unsupported evidence kind '{other}'"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -483,6 +567,8 @@ pub struct Trajectory {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct TrajectoryInputs {
+    #[serde(default)]
+    pub case_dir: Option<String>,
     #[serde(default)]
     pub alert: Option<String>,
     #[serde(default)]

@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 vigil-config = { path = "../vigil-config" }
 vigil-core = { path = "../vigil-core" }
 vigil-llm = { path = "../vigil-llm" }
+vigil-model = { path = "../vigil-model" }
 vigil-render = { path = "../vigil-render" }
 
 [lints]

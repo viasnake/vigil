@@ -25,6 +25,16 @@ The JSON brief is the serialized `EvidenceBrief` model.
 
 The trajectory records the investigation inputs, resolved targets, redacted evidence packet, validated reasoning result, final brief, LLM metadata when used, warnings, and errors. It does not contain Cloudflare credentials.
 
+For case investigation, default output paths are:
+
+```text
+<case-dir>/output/brief.md
+<case-dir>/output/brief.json
+<case-dir>/output/trajectory.json
+```
+
+Explicit output flags override these defaults.
+
 Render a Markdown brief from a saved trajectory:
 
 ```bash

@@ -1,14 +1,24 @@
-use std::{fs, path::PathBuf, process};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process,
+    str::FromStr,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use vigil_config::{
     check_output_path, check_readable_file, load_config, ConfigOverrides, OutputFormat,
+    ResolvedConfig,
 };
 use vigil_core::{
-    investigate, load_trajectory, validate_input_files, InvestigationRequest, ValidationRequest,
+    add_case_change, add_case_evidence, add_case_runbook, init_case, investigate, investigate_case,
+    load_trajectory, validate_input_files, CaseInitRequest, CaseInvestigationRequest,
+    ChangeAddRequest, EvidenceAddRequest, InvestigationRequest, RunbookAddRequest,
+    ValidationRequest,
 };
 use vigil_llm::{CloudflareAiGatewayConfig, CloudflareAiGatewayProvider, LlmProvider};
+use vigil_model::EvidenceKind;
 use vigil_render::{render_json, render_markdown, render_trajectory_json};
 
 #[derive(Debug, Parser)]
@@ -22,6 +32,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Case {
+        #[command(subcommand)]
+        command: CaseCommand,
+    },
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+    Change {
+        #[command(subcommand)]
+        command: ChangeCommand,
+    },
+    Runbook {
+        #[command(subcommand)]
+        command: RunbookCommand,
+    },
     Investigate(InvestigateArgs),
     Config {
         #[command(subcommand)]
@@ -32,12 +58,82 @@ enum Command {
     Version,
 }
 
+#[derive(Debug, Subcommand)]
+enum CaseCommand {
+    Init(CaseInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct CaseInitArgs {
+    #[arg(value_name = "CASE_DIR")]
+    case_dir: PathBuf,
+    #[arg(long, value_name = "TARGET")]
+    target: String,
+    #[arg(long, value_name = "SEVERITY")]
+    severity: String,
+    #[arg(long, value_name = "SUMMARY")]
+    summary: String,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceCommand {
+    Add(EvidenceAddArgs),
+}
+
+#[derive(Debug, Args)]
+struct EvidenceAddArgs {
+    #[arg(value_name = "CASE_DIR")]
+    case_dir: PathBuf,
+    #[arg(long, value_name = "KIND")]
+    kind: String,
+    #[arg(long, value_name = "SUMMARY")]
+    summary: String,
+    #[arg(long, value_name = "SOURCE")]
+    source: String,
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ChangeCommand {
+    Add(ChangeAddArgs),
+}
+
+#[derive(Debug, Args)]
+struct ChangeAddArgs {
+    #[arg(value_name = "CASE_DIR")]
+    case_dir: PathBuf,
+    #[arg(long, value_name = "SUMMARY")]
+    summary: String,
+    #[arg(long, value_name = "SOURCE")]
+    source: String,
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunbookCommand {
+    Add(RunbookAddArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunbookAddArgs {
+    #[arg(value_name = "CASE_DIR")]
+    case_dir: PathBuf,
+    #[arg(value_name = "RUNBOOK")]
+    runbook: PathBuf,
+}
+
 #[derive(Debug, Args)]
 struct InvestigateArgs {
     #[arg(long, value_name = "PATH")]
     alert: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
-    inventory: PathBuf,
+    inventory: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     runbook: Vec<PathBuf>,
     #[arg(long, value_name = "PATH")]
@@ -66,7 +162,7 @@ struct InvestigateArgs {
     dry_run: bool,
     #[arg(long)]
     no_llm: bool,
-    #[arg(value_name = "TARGET")]
+    #[arg(value_name = "TARGET_OR_CASE")]
     target: Option<String>,
 }
 
@@ -135,6 +231,18 @@ async fn run() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Case { command } => match command {
+            CaseCommand::Init(args) => run_case_init(args),
+        },
+        Command::Evidence { command } => match command {
+            EvidenceCommand::Add(args) => run_evidence_add(args),
+        },
+        Command::Change { command } => match command {
+            ChangeCommand::Add(args) => run_change_add(args),
+        },
+        Command::Runbook { command } => match command {
+            RunbookCommand::Add(args) => run_runbook_add(args),
+        },
         Command::Investigate(args) => run_investigate(args).await,
         Command::Config { command } => match command {
             ConfigCommand::Check(args) => run_config_check(args),
@@ -149,13 +257,6 @@ async fn run() -> Result<()> {
 }
 
 async fn run_investigate(args: InvestigateArgs) -> Result<()> {
-    check_readable_file(&args.inventory)?;
-    if let Some(alert) = &args.alert {
-        check_readable_file(alert)?;
-    }
-    for runbook in &args.runbook {
-        check_readable_file(runbook)?;
-    }
     check_requested_outputs(&[
         args.output.as_ref(),
         args.json_output.as_ref(),
@@ -172,36 +273,40 @@ async fn run_investigate(args: InvestigateArgs) -> Result<()> {
         output_format: None,
     };
     let config = load_config(args.config.as_deref(), overrides)?;
-
-    let provider = if args.no_llm || args.dry_run {
-        None
-    } else {
-        config.cloudflare.validate_for_llm()?;
-        Some(CloudflareAiGatewayProvider::new(
-            CloudflareAiGatewayConfig::new(
-                required_setting(
-                    config.cloudflare.account_id.clone(),
-                    "Cloudflare account ID",
-                )?,
-                required_setting(config.cloudflare.api_token.clone(), "Cloudflare API token")?,
-                required_setting(
-                    config.cloudflare.gateway_id.clone(),
-                    "Cloudflare AI Gateway ID",
-                )?,
-                config.cloudflare.model.clone(),
-                config.cloudflare.request_timeout_secs,
-                config.cloudflare.retry_count,
-            )?,
-        )?)
-    };
+    let provider = build_provider(&config, args.no_llm || args.dry_run)?;
     let provider_ref = provider
         .as_ref()
         .map(|provider| provider as &dyn LlmProvider);
 
+    if should_use_case_mode(&args)? {
+        run_case_investigate(args, provider_ref).await
+    } else {
+        run_file_investigate(args, provider_ref, config.output_format).await
+    }
+}
+
+async fn run_file_investigate(
+    args: InvestigateArgs,
+    provider_ref: Option<&dyn LlmProvider>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let inventory = args.inventory.as_ref().ok_or_else(|| {
+        anyhow!(
+            "file-based investigation requires --inventory. To investigate a case, pass only the case directory, for example: vigil investigate web-5xx"
+        )
+    })?;
+    check_readable_file(inventory)?;
+    if let Some(alert) = &args.alert {
+        check_readable_file(alert)?;
+    }
+    for runbook in &args.runbook {
+        check_readable_file(runbook)?;
+    }
+
     let outcome = investigate(
         InvestigationRequest {
             alert_path: args.alert.clone(),
-            inventory_path: args.inventory.clone(),
+            inventory_path: inventory.clone(),
             runbook_paths: args.runbook.clone(),
             runbook_dir: args.runbook_dir.clone(),
             target: args.target.clone(),
@@ -227,12 +332,110 @@ async fn run_investigate(args: InvestigateArgs) -> Result<()> {
     }
 
     if args.output.is_none() && args.json_output.is_none() {
-        match config.output_format {
+        match output_format {
             OutputFormat::Markdown => println!("{markdown}"),
             OutputFormat::Json => println!("{brief_json}"),
         }
     }
 
+    Ok(())
+}
+
+async fn run_case_investigate(
+    args: InvestigateArgs,
+    provider_ref: Option<&dyn LlmProvider>,
+) -> Result<()> {
+    let case_dir = args
+        .target
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("case investigation requires a case directory"))?;
+    let output_dir = case_dir.join("output");
+    fs::create_dir_all(&output_dir).with_context(|| {
+        format!(
+            "case output directory '{}' could not be created",
+            output_dir.display()
+        )
+    })?;
+
+    let outcome = investigate_case(
+        CaseInvestigationRequest {
+            case_dir: case_dir.clone(),
+            no_llm: args.no_llm,
+            dry_run: args.dry_run,
+        },
+        provider_ref,
+    )
+    .await?;
+
+    let markdown = render_markdown(&outcome.brief);
+    let brief_json = render_json(&outcome.brief)?;
+    let trajectory_json = render_trajectory_json(&outcome.trajectory)?;
+    let brief_path = args.output.unwrap_or_else(|| output_dir.join("brief.md"));
+    let json_path = args
+        .json_output
+        .unwrap_or_else(|| output_dir.join("brief.json"));
+    let trajectory_path = args
+        .trajectory_output
+        .unwrap_or_else(|| output_dir.join("trajectory.json"));
+
+    write_output(&brief_path, &markdown)?;
+    write_output(&json_path, &brief_json)?;
+    write_output(&trajectory_path, &trajectory_json)?;
+    println!("wrote {}", brief_path.display());
+    println!("wrote {}", json_path.display());
+    println!("wrote {}", trajectory_path.display());
+    Ok(())
+}
+
+fn run_case_init(args: CaseInitArgs) -> Result<()> {
+    let manifest = init_case(CaseInitRequest {
+        case_dir: args.case_dir.clone(),
+        target: args.target,
+        severity: args.severity,
+        summary: args.summary,
+        force: args.force,
+    })?;
+    println!("created case {}", args.case_dir.display());
+    println!("id: {}", manifest.id);
+    Ok(())
+}
+
+fn run_evidence_add(args: EvidenceAddArgs) -> Result<()> {
+    if let Some(file) = &args.file {
+        check_readable_file(file)?;
+    }
+    let kind = EvidenceKind::from_str(&args.kind)?;
+    let added = add_case_evidence(EvidenceAddRequest {
+        case_dir: args.case_dir,
+        kind,
+        summary: args.summary,
+        source: args.source,
+        url: args.url,
+        file: args.file,
+    })?;
+    println!("added evidence {}", added.path.display());
+    Ok(())
+}
+
+fn run_change_add(args: ChangeAddArgs) -> Result<()> {
+    let added = add_case_change(ChangeAddRequest {
+        case_dir: args.case_dir,
+        summary: args.summary,
+        source: args.source,
+        url: args.url,
+    })?;
+    println!("added change evidence {}", added.path.display());
+    Ok(())
+}
+
+fn run_runbook_add(args: RunbookAddArgs) -> Result<()> {
+    check_readable_file(&args.runbook)?;
+    let path = add_case_runbook(RunbookAddRequest {
+        case_dir: args.case_dir,
+        runbook_path: args.runbook,
+    })?;
+    println!("added runbook {}", path.display());
     Ok(())
 }
 
@@ -298,11 +501,61 @@ fn check_requested_outputs(paths: &[Option<&PathBuf>]) -> Result<()> {
     Ok(())
 }
 
-fn write_output(path: &PathBuf, text: &str) -> Result<()> {
+fn write_output(path: &Path, text: &str) -> Result<()> {
     fs::write(path, text)
         .with_context(|| format!("output file '{}' could not be written", path.display()))
 }
 
 fn required_setting(value: Option<String>, name: &'static str) -> Result<String> {
     value.with_context(|| format!("missing {name}; run 'vigil config check' for details"))
+}
+
+fn build_provider(
+    config: &ResolvedConfig,
+    skip_llm: bool,
+) -> Result<Option<CloudflareAiGatewayProvider>> {
+    if skip_llm {
+        return Ok(None);
+    }
+
+    config.cloudflare.validate_for_llm()?;
+    Ok(Some(CloudflareAiGatewayProvider::new(
+        CloudflareAiGatewayConfig::new(
+            required_setting(
+                config.cloudflare.account_id.clone(),
+                "Cloudflare account ID",
+            )?,
+            required_setting(config.cloudflare.api_token.clone(), "Cloudflare API token")?,
+            required_setting(
+                config.cloudflare.gateway_id.clone(),
+                "Cloudflare AI Gateway ID",
+            )?,
+            config.cloudflare.model.clone(),
+            config.cloudflare.request_timeout_secs,
+            config.cloudflare.retry_count,
+        )?,
+    )?))
+}
+
+fn should_use_case_mode(args: &InvestigateArgs) -> Result<bool> {
+    let has_file_mode_flags = args.alert.is_some()
+        || args.inventory.is_some()
+        || !args.runbook.is_empty()
+        || args.runbook_dir.is_some();
+
+    let Some(positional) = &args.target else {
+        return Ok(false);
+    };
+
+    let positional_path = Path::new(positional);
+    let positional_is_case = positional_path.join("vigil.yaml").exists();
+    if positional_is_case && has_file_mode_flags {
+        return Err(anyhow!(
+            "ambiguous investigation input: '{}' is a case directory, but file-mode flags were also supplied. Use either 'vigil investigate {}' or the file-based --alert/--inventory workflow, not both.",
+            positional,
+            positional
+        ));
+    }
+
+    Ok(!has_file_mode_flags)
 }
