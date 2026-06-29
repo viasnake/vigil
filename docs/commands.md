@@ -97,6 +97,7 @@ Shared options:
 --trajectory-output <PATH>
 --config <PATH>
 --model <MODEL>
+--endpoint <ENDPOINT>
 --gateway-id <GATEWAY_ID>
 --account-id <ACCOUNT_ID>
 --api-token <TOKEN>
@@ -119,6 +120,8 @@ TARGET
 If the positional argument is a case directory, do not combine it with file-mode flags.
 
 `--no-llm` produces deterministic output for tests and local verification. `--dry-run` also avoids an LLM request.
+
+`--endpoint` accepts `rest` or `gateway`. `rest` is the default Cloudflare REST API path. `gateway` uses the documented `gateway.ai.cloudflare.com` provider-native path.
 
 ## `vigil config check`
 

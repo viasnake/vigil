@@ -1407,6 +1407,12 @@ fn redact_value(value: &mut Value, key: Option<&str>, masked_values: &mut usize)
             {
                 *text = "[REDACTED]".to_string();
                 *masked_values += 1;
+            } else {
+                let (redacted, masked) = redact_inline_secret_values(text);
+                if masked > 0 {
+                    *text = redacted;
+                    *masked_values += masked;
+                }
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -1446,6 +1452,107 @@ fn looks_token_like(value: &str) -> bool {
         && !trimmed.contains(char::is_whitespace)
         && trimmed.chars().any(|char| char.is_ascii_alphabetic())
         && trimmed.chars().any(|char| char.is_ascii_digit())
+}
+
+fn redact_inline_secret_values(input: &str) -> (String, usize) {
+    let (with_assignments, assignment_count) = redact_secret_assignments(input);
+    let (with_tokens, token_count) = redact_token_prefixes(&with_assignments);
+    (with_tokens, assignment_count + token_count)
+}
+
+fn redact_secret_assignments(input: &str) -> (String, usize) {
+    let patterns = [
+        "api_token=",
+        "api-key=",
+        "api_key=",
+        "apikey=",
+        "authorization=",
+        "password=",
+        "secret=",
+        "token=",
+    ];
+    let lower = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    let mut masked = 0;
+
+    while index < input.len() {
+        let Some((pattern_index, pattern)) = patterns
+            .iter()
+            .filter_map(|pattern| {
+                lower[index..]
+                    .find(pattern)
+                    .map(|offset| (index + offset, *pattern))
+            })
+            .min_by_key(|(position, _)| *position)
+        else {
+            output.push_str(&input[index..]);
+            break;
+        };
+
+        output.push_str(&input[index..pattern_index]);
+        let value_start = pattern_index + pattern.len();
+        output.push_str(&input[pattern_index..value_start]);
+
+        let value_end = input[value_start..]
+            .find(secret_value_terminator)
+            .map(|offset| value_start + offset)
+            .unwrap_or(input.len());
+
+        if value_end > value_start {
+            output.push_str("[REDACTED]");
+            masked += 1;
+        }
+        index = value_end;
+    }
+
+    (output, masked)
+}
+
+fn secret_value_terminator(character: char) -> bool {
+    character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | ')' | ']')
+}
+
+fn redact_token_prefixes(input: &str) -> (String, usize) {
+    let prefixes = ["sk-", "ghp_", "xox", "cfut_"];
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    let mut masked = 0;
+
+    while index < input.len() {
+        let Some((prefix_index, prefix)) = prefixes
+            .iter()
+            .filter_map(|prefix| {
+                input[index..]
+                    .find(prefix)
+                    .map(|offset| (index + offset, *prefix))
+            })
+            .min_by_key(|(position, _)| *position)
+        else {
+            output.push_str(&input[index..]);
+            break;
+        };
+
+        output.push_str(&input[index..prefix_index]);
+        let token_end = input[prefix_index..]
+            .find(|character: char| !is_token_character(character))
+            .map(|offset| prefix_index + offset)
+            .unwrap_or(input.len());
+
+        if token_end > prefix_index + prefix.len() {
+            output.push_str("[REDACTED]");
+            masked += 1;
+        } else {
+            output.push_str(prefix);
+        }
+        index = token_end;
+    }
+
+    (output, masked)
+}
+
+fn is_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 fn display_path(path: &Path) -> String {
@@ -1592,6 +1699,45 @@ checks:
 
         assert_eq!(packet.redaction.masked_values, 1);
         assert_eq!(packet.metadata["api_token"], "[REDACTED]");
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_inline_secret_values_in_log_content() -> Result<(), Box<dyn std::error::Error>> {
+        let mut packet = EvidencePacket {
+            investigation_id: "test".to_string(),
+            question: "test".to_string(),
+            targets: Vec::new(),
+            alerts: Vec::new(),
+            evidence: vec![Evidence {
+                id: "log-001".to_string(),
+                kind: EvidenceKind::Log,
+                summary: "log with inline secret".to_string(),
+                source: EvidenceSource {
+                    kind: "test".to_string(),
+                    name: "test".to_string(),
+                    path: None,
+                },
+                target: None,
+                timestamp: None,
+                confidence: 1.0,
+                data: json!({
+                    "content": "auth failed api_token=sk-redaction-placeholder-1234567890"
+                }),
+                references: Vec::new(),
+            }],
+            runbooks: Vec::new(),
+            constraints: InvestigationConstraints::default(),
+            redaction: RedactionReport::default(),
+            metadata: BTreeMap::new(),
+        };
+
+        packet = redact_evidence_packet(packet)?;
+        let content = packet.evidence[0].data["content"]
+            .as_str()
+            .ok_or("missing content")?;
+        assert!(content.contains("api_token=[REDACTED]"));
+        assert!(!content.contains("sk-redaction-placeholder-1234567890"));
         Ok(())
     }
 

@@ -42,6 +42,15 @@ export VIGIL_LLM_MODEL=openai/gpt-4.1
 cargo run -p vigil-cli -- investigate /tmp/web-5xx
 ```
 
+For authenticated Gateway tokens or Workers AI models, use the Gateway endpoint:
+
+```bash
+export VIGIL_CLOUDFLARE_ENDPOINT=gateway
+export VIGIL_LLM_MODEL=@cf/meta/llama-3.1-8b-instruct-fast
+
+cargo run -p vigil-cli -- investigate /tmp/web-5xx
+```
+
 ## Commands
 
 ```text

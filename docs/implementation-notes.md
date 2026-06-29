@@ -13,9 +13,11 @@ Concise implementation knowledge discovered while building Vigil.
 
 ## Technical Findings
 
-* Cloudflare AI Gateway integration uses the current REST chat-completions endpoint at `api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions` with the `cf-aig-gateway-id` header.
+* Cloudflare AI Gateway integration defaults to the current REST chat-completions endpoint at `api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions` with the `cf-aig-gateway-id` header.
+* The Cloudflare provider also supports the documented `gateway.ai.cloudflare.com` provider-native path through `endpoint = "gateway"` / `VIGIL_CLOUDFLARE_ENDPOINT=gateway`; Workers AI `@cf/` models use `workers-ai/v1/chat/completions` with `cf-aig-authorization`.
 * `ReasoningResult` is schema-validated and then semantically checked for non-empty required content, confidence ranges, read-only recommendations, and obvious runnable shell-command text in recommended checks.
-* The core workflow builds a redacted `EvidencePacket` before any LLM call. Redaction masks common secret-like field names and some token-like values, but remains best-effort.
+* The core workflow builds a redacted `EvidencePacket` before any LLM call. Redaction masks common secret-like field names, token-like values, and common inline secret assignments such as `api_token=...`, but remains best-effort.
+* The LLM prompt was simplified after live testing with smaller Workers AI models; the provider also normalizes common small-model shape drift before applying the same schema and semantic validation.
 * Tests avoid real Cloudflare credentials by using deterministic `--no-llm` mode and a mock provider.
 * CLI smoke tests cover `vigil version`, `vigil validate` with `examples/minimal`, `vigil investigate` with `examples/minimal --no-llm`, and rendering from a saved trajectory.
 * Markdown rendering has a golden-style fixture at `crates/vigil-render/tests/fixtures/evidence_brief.md`.
@@ -25,23 +27,25 @@ Concise implementation knowledge discovered while building Vigil.
 
 ## Validation Notes
 
-* `cargo fmt --check` passed after the case UX updates and temporary Cloudflare validation notes.
-* `cargo clippy --workspace --all-targets -- -D warnings` passed after the case UX updates and temporary Cloudflare validation notes.
-* `cargo test --workspace` passed after the case UX updates and temporary Cloudflare validation notes.
+* `cargo fmt --check` passed after the live product-evaluation fixes.
+* `cargo clippy --workspace --all-targets -- -D warnings` passed after the live product-evaluation fixes.
+* `cargo test --workspace` passed after the live product-evaluation fixes.
 * Manual case flow passed with `/tmp/web-5xx`: `case init`, `evidence add --kind metric --url`, `change add --url`, `runbook add`, and `investigate /tmp/web-5xx --no-llm`.
 * Manual log evidence intake passed with `evidence add --kind log --file /tmp/timeout-snippet.txt`.
 * Manual file-based compatibility run passed with `examples/minimal` and explicit Markdown, JSON, and trajectory outputs.
 * Manual ambiguous-input check passed: `vigil investigate /tmp/web-5xx --inventory examples/minimal/inventory.yaml --no-llm` failed with an actionable ambiguity error.
 * Temporary live Cloudflare validation on 2026-06-29 did not produce an LLM response: `vigil investigate /tmp/web-5xx` against the REST endpoint returned HTTP 401, and a direct minimal REST request returned the same authentication error.
-* A provider-native `gateway.ai.cloudflare.com` diagnostic using Gateway authentication reached Cloudflare AI Gateway but returned HTTP 402 `Insufficient wholesale credits`; live end-to-end LLM output remains unvalidated.
+* A provider-native `gateway.ai.cloudflare.com` diagnostic using Gateway authentication reached Cloudflare AI Gateway for an OpenAI-compatible model but returned HTTP 402 `Insufficient wholesale credits`.
 * Workers AI lightweight model validation on 2026-06-29 used `@cf/meta/llama-3.2-1b-instruct`: direct Workers AI REST, AI Gateway REST, and `vigil investigate /tmp/web-5xx` all returned HTTP 401 with the temporary token.
-* The same Workers AI model returned HTTP 200 for a simple prompt through `gateway.ai.cloudflare.com/.../workers-ai/v1/chat/completions` with Gateway authentication, confirming the model/gateway path works but not through Vigil's current REST implementation with that token.
+* The same Workers AI model returned HTTP 200 for a simple prompt through `gateway.ai.cloudflare.com/.../workers-ai/v1/chat/completions` with Gateway authentication, confirming the model/gateway path worked before Vigil supported that endpoint style.
+* Live product evaluation on 2026-06-30 succeeded through `VIGIL_CLOUDFLARE_ENDPOINT=gateway` with `@cf/meta/llama-3.1-8b-instruct-fast` for web 5xx, checkout latency, and payment auth-failure case workflows.
+* Live evaluation showed `@cf/meta/llama-3.2-1b-instruct` is too weak for Vigil's structured `ReasoningResult` contract: it can answer simple prompts, but did not produce schema-valid investigation output.
+* Live evaluation found and fixed a redaction gap where inline secrets inside log file content, such as `api_token=...`, reached brief JSON and trajectory output.
 
 ## Known Limitations
 
-* Real Cloudflare requests were attempted with temporary credentials, but no successful LLM response was received because the REST request failed authentication and the provider-native diagnostic hit account credits.
-* The temporary token behaves as a provider-native Gateway authentication token; Vigil currently expects the REST API path with a Cloudflare API token accepted by `api.cloudflare.com`.
 * Redaction is intentionally basic and cannot guarantee perfect secret detection.
+* Prompt-injection text inside supplied evidence remains visible as evidence content after secret redaction; validation prevents generated recommended checks from becoming shell commands, but raw evidence should still be reviewed before sharing output.
 * File inputs cover alert, inventory, and runbook evidence; there are no log, metric, change, ticketing, or monitoring adapters.
 
 ## Open Questions

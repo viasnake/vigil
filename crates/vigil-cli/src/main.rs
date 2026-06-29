@@ -8,8 +8,8 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use vigil_config::{
-    check_output_path, check_readable_file, load_config, ConfigOverrides, OutputFormat,
-    ResolvedConfig,
+    check_output_path, check_readable_file, load_config, CloudflareEndpoint, ConfigOverrides,
+    OutputFormat, ResolvedConfig,
 };
 use vigil_core::{
     add_case_change, add_case_evidence, add_case_runbook, init_case, investigate, investigate_case,
@@ -17,7 +17,9 @@ use vigil_core::{
     ChangeAddRequest, EvidenceAddRequest, InvestigationRequest, RunbookAddRequest,
     ValidationRequest,
 };
-use vigil_llm::{CloudflareAiGatewayConfig, CloudflareAiGatewayProvider, LlmProvider};
+use vigil_llm::{
+    CloudflareAiGatewayConfig, CloudflareAiGatewayProvider, CloudflareEndpointStyle, LlmProvider,
+};
 use vigil_model::EvidenceKind;
 use vigil_render::{render_json, render_markdown, render_trajectory_json};
 
@@ -148,6 +150,8 @@ struct InvestigateArgs {
     config: Option<PathBuf>,
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
+    #[arg(long, value_name = "ENDPOINT")]
+    endpoint: Option<String>,
     #[arg(long, value_name = "GATEWAY_ID")]
     gateway_id: Option<String>,
     #[arg(long, value_name = "ACCOUNT_ID")]
@@ -183,6 +187,8 @@ struct ConfigCheckArgs {
     output: Option<PathBuf>,
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
+    #[arg(long, value_name = "ENDPOINT")]
+    endpoint: Option<String>,
     #[arg(long, value_name = "GATEWAY_ID")]
     gateway_id: Option<String>,
     #[arg(long, value_name = "ACCOUNT_ID")]
@@ -268,6 +274,7 @@ async fn run_investigate(args: InvestigateArgs) -> Result<()> {
         api_token: args.api_token.clone(),
         gateway_id: args.gateway_id.clone(),
         model: args.model.clone(),
+        endpoint: parse_endpoint_override(args.endpoint.as_deref())?,
         request_timeout_secs: args.request_timeout_secs,
         retry_count: args.retry_count,
         output_format: None,
@@ -447,6 +454,7 @@ fn run_config_check(args: ConfigCheckArgs) -> Result<()> {
             api_token: args.api_token,
             gateway_id: args.gateway_id,
             model: args.model,
+            endpoint: parse_endpoint_override(args.endpoint.as_deref())?,
             request_timeout_secs: args.request_timeout_secs,
             retry_count: args.retry_count,
             output_format: None,
@@ -533,8 +541,22 @@ fn build_provider(
             config.cloudflare.model.clone(),
             config.cloudflare.request_timeout_secs,
             config.cloudflare.retry_count,
-        )?,
+        )?
+        .with_endpoint_style(match config.cloudflare.endpoint {
+            CloudflareEndpoint::Rest => CloudflareEndpointStyle::Rest,
+            CloudflareEndpoint::Gateway => CloudflareEndpointStyle::Gateway,
+        }),
     )?))
+}
+
+fn parse_endpoint_override(value: Option<&str>) -> Result<Option<CloudflareEndpoint>> {
+    value
+        .map(|value| {
+            CloudflareEndpoint::parse(value).ok_or_else(|| {
+                anyhow!("invalid Cloudflare endpoint '{value}'. Use 'rest' or 'gateway'.")
+            })
+        })
+        .transpose()
 }
 
 fn should_use_case_mode(args: &InvestigateArgs) -> Result<bool> {

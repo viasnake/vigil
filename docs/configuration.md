@@ -18,9 +18,11 @@ Optional:
 
 ```text
 VIGIL_LLM_MODEL
+VIGIL_CLOUDFLARE_ENDPOINT
 ```
 
 The default model is `openai/gpt-4.1`, routed through Cloudflare AI Gateway.
+The default endpoint is `rest`. Set `VIGIL_CLOUDFLARE_ENDPOINT=gateway` to use Cloudflare's `gateway.ai.cloudflare.com` provider-native path, which is useful for authenticated Gateway tokens and Workers AI models such as `@cf/meta/llama-3.1-8b-instruct-fast`.
 
 TOML config files are supported:
 
@@ -30,6 +32,7 @@ account_id = "..."
 api_token = "..."
 gateway_id = "..."
 model = "openai/gpt-4.1"
+endpoint = "rest"
 request_timeout_secs = 30
 retry_count = 1
 

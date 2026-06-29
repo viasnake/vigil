@@ -12,6 +12,18 @@ Set `CLOUDFLARE_API_TOKEN`, add `cloudflare.api_token` to the TOML config file, 
 
 Set `VIGIL_CLOUDFLARE_GATEWAY_ID`, add `cloudflare.gateway_id` to the TOML config file, or pass `--gateway-id`.
 
+## Cloudflare 401 With Gateway Tokens
+
+The default endpoint is `rest`, which calls `api.cloudflare.com` with `Authorization: Bearer ...`.
+
+If your token is for an authenticated AI Gateway on `gateway.ai.cloudflare.com`, set:
+
+```bash
+export VIGIL_CLOUDFLARE_ENDPOINT=gateway
+```
+
+or pass `--endpoint gateway`.
+
 ## Invalid Input
 
 Run:

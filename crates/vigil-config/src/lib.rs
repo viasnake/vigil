@@ -44,6 +44,7 @@ pub struct ConfigOverrides {
     pub api_token: Option<String>,
     pub gateway_id: Option<String>,
     pub model: Option<String>,
+    pub endpoint: Option<CloudflareEndpoint>,
     pub request_timeout_secs: Option<u64>,
     pub retry_count: Option<u32>,
     pub output_format: Option<OutputFormat>,
@@ -66,6 +67,30 @@ impl OutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CloudflareEndpoint {
+    #[default]
+    Rest,
+    Gateway,
+}
+
+impl CloudflareEndpoint {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rest" => Some(Self::Rest),
+            "gateway" | "provider-native" | "provider_native" => Some(Self::Gateway),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rest => "rest",
+            Self::Gateway => "gateway",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub cloudflare: CloudflareSettings,
@@ -78,6 +103,7 @@ pub struct CloudflareSettings {
     pub api_token: Option<String>,
     pub gateway_id: Option<String>,
     pub model: String,
+    pub endpoint: CloudflareEndpoint,
     pub request_timeout_secs: u64,
     pub retry_count: u32,
 }
@@ -129,8 +155,11 @@ impl CloudflareSettings {
         };
 
         format!(
-            "account_id={account}, gateway_id={gateway}, api_token={token}, model={}, timeout={}s, retries={}",
-            self.model, self.request_timeout_secs, self.retry_count
+            "account_id={account}, gateway_id={gateway}, api_token={token}, model={}, endpoint={}, timeout={}s, retries={}",
+            self.model,
+            self.endpoint.as_str(),
+            self.request_timeout_secs,
+            self.retry_count
         )
     }
 }
@@ -149,6 +178,7 @@ struct FileCloudflareConfig {
     api_token: Option<String>,
     gateway_id: Option<String>,
     model: Option<String>,
+    endpoint: Option<String>,
     request_timeout_secs: Option<u64>,
     retry_count: Option<u32>,
 }
@@ -168,6 +198,7 @@ pub fn load_config(
             api_token: None,
             gateway_id: None,
             model: "openai/gpt-4.1".to_string(),
+            endpoint: CloudflareEndpoint::Rest,
             request_timeout_secs: 30,
             retry_count: 1,
         },
@@ -246,6 +277,14 @@ fn merge_file_config(path: &Path, config: &mut ResolvedConfig) -> Result<(), Con
     if let Some(model) = normalize_optional(file_config.cloudflare.model) {
         config.cloudflare.model = model;
     }
+    if let Some(endpoint) = file_config
+        .cloudflare
+        .endpoint
+        .as_deref()
+        .and_then(CloudflareEndpoint::parse)
+    {
+        config.cloudflare.endpoint = endpoint;
+    }
     if let Some(timeout) = file_config.cloudflare.request_timeout_secs {
         config.cloudflare.request_timeout_secs = timeout;
     }
@@ -280,6 +319,12 @@ fn merge_env_config(config: &mut ResolvedConfig) {
     if let Some(model) = env_string("VIGIL_LLM_MODEL") {
         config.cloudflare.model = model;
     }
+    if let Some(endpoint) = env_string("VIGIL_CLOUDFLARE_ENDPOINT")
+        .as_deref()
+        .and_then(CloudflareEndpoint::parse)
+    {
+        config.cloudflare.endpoint = endpoint;
+    }
 }
 
 fn merge_overrides(config: &mut ResolvedConfig, overrides: ConfigOverrides) {
@@ -297,6 +342,9 @@ fn merge_overrides(config: &mut ResolvedConfig, overrides: ConfigOverrides) {
     );
     if let Some(model) = normalize_optional(overrides.model) {
         config.cloudflare.model = model;
+    }
+    if let Some(endpoint) = overrides.endpoint {
+        config.cloudflare.endpoint = endpoint;
     }
     if let Some(timeout) = overrides.request_timeout_secs {
         config.cloudflare.request_timeout_secs = timeout;
@@ -367,6 +415,7 @@ account_id = "from-file"
 api_token = "..."
 gateway_id = "file-gateway"
 model = "openai/gpt-4.1"
+endpoint = "gateway"
 request_timeout_secs = 12
 retry_count = 2
 
@@ -387,6 +436,7 @@ format = "json"
         assert_eq!(config.cloudflare.account_id.as_deref(), Some("from-file"));
         assert_eq!(config.cloudflare.gateway_id.as_deref(), Some("cli-gateway"));
         assert_eq!(config.cloudflare.model, "openai/gpt-4.1-mini");
+        assert_eq!(config.cloudflare.endpoint, CloudflareEndpoint::Gateway);
         assert_eq!(config.output_format, OutputFormat::Json);
         Ok(())
     }
@@ -398,6 +448,7 @@ format = "json"
             api_token: None,
             gateway_id: Some("gateway".to_string()),
             model: "openai/gpt-4.1".to_string(),
+            endpoint: CloudflareEndpoint::Rest,
             request_timeout_secs: 30,
             retry_count: 0,
         };
@@ -419,6 +470,7 @@ format = "json"
             api_token: Some("secret-token-value".to_string()),
             gateway_id: Some("gateway".to_string()),
             model: "openai/gpt-4.1".to_string(),
+            endpoint: CloudflareEndpoint::Rest,
             request_timeout_secs: 30,
             retry_count: 1,
         };
@@ -426,5 +478,22 @@ format = "json"
         let summary = config.redacted_summary();
         assert!(summary.contains("api_token=<set>"));
         assert!(!summary.contains("secret-token-value"));
+    }
+
+    #[test]
+    fn parses_cloudflare_endpoint_values() {
+        assert_eq!(
+            CloudflareEndpoint::parse("gateway"),
+            Some(CloudflareEndpoint::Gateway)
+        );
+        assert_eq!(
+            CloudflareEndpoint::parse("provider-native"),
+            Some(CloudflareEndpoint::Gateway)
+        );
+        assert_eq!(
+            CloudflareEndpoint::parse("rest"),
+            Some(CloudflareEndpoint::Rest)
+        );
+        assert_eq!(CloudflareEndpoint::parse("unknown"), None);
     }
 }
