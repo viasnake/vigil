@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -95,6 +96,8 @@ impl CloudflareEndpoint {
 pub struct ResolvedConfig {
     pub cloudflare: CloudflareSettings,
     pub output_format: OutputFormat,
+    pub sources: SourceSettings,
+    pub investigation: InvestigationSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +109,82 @@ pub struct CloudflareSettings {
     pub endpoint: CloudflareEndpoint,
     pub request_timeout_secs: u64,
     pub retry_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceSettings {
+    pub inventory_files: Vec<InventoryFileSource>,
+    pub runbook_files: Vec<RunbookFileSource>,
+    pub alertmanagers: Vec<MockableSource>,
+    pub prometheus: Vec<MockableSource>,
+    pub github: Vec<GithubSource>,
+    pub http: Vec<MockableSource>,
+    pub dns: Vec<DnsSource>,
+    pub loki: Vec<MockableSource>,
+    pub grafana: Vec<MockableSource>,
+    pub kubernetes: Vec<KubernetesSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryFileSource {
+    pub name: String,
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunbookFileSource {
+    pub name: String,
+    pub dir: Option<PathBuf>,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockableSource {
+    pub name: String,
+    pub url: Option<String>,
+    pub fixture_path: Option<PathBuf>,
+    pub bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsSource {
+    pub name: String,
+    pub fixture_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubSource {
+    pub name: String,
+    pub api_url: Option<String>,
+    pub repo: Option<String>,
+    pub fixture_path: Option<PathBuf>,
+    pub bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesSource {
+    pub name: String,
+    pub url: Option<String>,
+    pub namespace: Option<String>,
+    pub fixture_path: Option<PathBuf>,
+    pub bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvestigationSettings {
+    pub max_iterations: u32,
+    pub max_tool_calls: u32,
+    pub max_duration_secs: u64,
+}
+
+impl Default for InvestigationSettings {
+    fn default() -> Self {
+        Self {
+            max_iterations: 2,
+            max_tool_calls: 8,
+            max_duration_secs: 60,
+        }
+    }
 }
 
 impl CloudflareSettings {
@@ -170,6 +249,10 @@ struct FileConfig {
     cloudflare: FileCloudflareConfig,
     #[serde(default)]
     output: FileOutputConfig,
+    #[serde(default)]
+    sources: FileSourcesConfig,
+    #[serde(default)]
+    investigation: FileInvestigationConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -188,6 +271,77 @@ struct FileOutputConfig {
     format: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct FileSourcesConfig {
+    #[serde(default)]
+    inventory: BTreeMap<String, FileInventorySource>,
+    #[serde(default)]
+    runbook: BTreeMap<String, FileRunbookSource>,
+    #[serde(default)]
+    alertmanager: BTreeMap<String, FileMockableSource>,
+    #[serde(default)]
+    prometheus: BTreeMap<String, FileMockableSource>,
+    #[serde(default)]
+    github: BTreeMap<String, FileGithubSource>,
+    #[serde(default)]
+    http: BTreeMap<String, FileMockableSource>,
+    #[serde(default)]
+    dns: BTreeMap<String, FileDnsSource>,
+    #[serde(default)]
+    loki: BTreeMap<String, FileMockableSource>,
+    #[serde(default)]
+    grafana: BTreeMap<String, FileMockableSource>,
+    #[serde(default)]
+    kubernetes: BTreeMap<String, FileKubernetesSource>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileInventorySource {
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileRunbookSource {
+    dir: Option<PathBuf>,
+    #[serde(default)]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileMockableSource {
+    url: Option<String>,
+    fixture_path: Option<PathBuf>,
+    bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileDnsSource {
+    fixture_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileGithubSource {
+    api_url: Option<String>,
+    repo: Option<String>,
+    fixture_path: Option<PathBuf>,
+    bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileKubernetesSource {
+    url: Option<String>,
+    namespace: Option<String>,
+    fixture_path: Option<PathBuf>,
+    bearer_token_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileInvestigationConfig {
+    max_iterations: Option<u32>,
+    max_tool_calls: Option<u32>,
+    max_duration_secs: Option<u64>,
+}
+
 pub fn load_config(
     config_path: Option<&Path>,
     overrides: ConfigOverrides,
@@ -203,6 +357,8 @@ pub fn load_config(
             retry_count: 1,
         },
         output_format: OutputFormat::Markdown,
+        sources: SourceSettings::default(),
+        investigation: InvestigationSettings::default(),
     };
 
     if let Some(path) = config_path {
@@ -299,8 +455,138 @@ fn merge_file_config(path: &Path, config: &mut ResolvedConfig) -> Result<(), Con
     {
         config.output_format = format;
     }
+    merge_sources(file_config.sources, &mut config.sources);
+    if let Some(max_iterations) = file_config.investigation.max_iterations {
+        config.investigation.max_iterations = max_iterations;
+    }
+    if let Some(max_tool_calls) = file_config.investigation.max_tool_calls {
+        config.investigation.max_tool_calls = max_tool_calls;
+    }
+    if let Some(max_duration_secs) = file_config.investigation.max_duration_secs {
+        config.investigation.max_duration_secs = max_duration_secs;
+    }
 
     Ok(())
+}
+
+fn merge_sources(file_sources: FileSourcesConfig, sources: &mut SourceSettings) {
+    sources
+        .inventory_files
+        .extend(
+            file_sources
+                .inventory
+                .into_iter()
+                .map(|(name, source)| InventoryFileSource {
+                    name,
+                    path: source.path,
+                }),
+        );
+    sources
+        .runbook_files
+        .extend(
+            file_sources
+                .runbook
+                .into_iter()
+                .map(|(name, source)| RunbookFileSource {
+                    name,
+                    dir: source.dir,
+                    paths: source.paths,
+                }),
+        );
+    sources
+        .alertmanagers
+        .extend(
+            file_sources
+                .alertmanager
+                .into_iter()
+                .map(|(name, source)| MockableSource {
+                    name,
+                    url: normalize_optional(source.url),
+                    fixture_path: source.fixture_path,
+                    bearer_token_env: normalize_optional(source.bearer_token_env),
+                }),
+        );
+    sources
+        .prometheus
+        .extend(
+            file_sources
+                .prometheus
+                .into_iter()
+                .map(|(name, source)| MockableSource {
+                    name,
+                    url: normalize_optional(source.url),
+                    fixture_path: source.fixture_path,
+                    bearer_token_env: normalize_optional(source.bearer_token_env),
+                }),
+        );
+    sources.github.extend(
+        file_sources
+            .github
+            .into_iter()
+            .map(|(name, source)| GithubSource {
+                name,
+                api_url: normalize_optional(source.api_url),
+                repo: normalize_optional(source.repo),
+                fixture_path: source.fixture_path,
+                bearer_token_env: normalize_optional(source.bearer_token_env),
+            }),
+    );
+    sources.http.extend(
+        file_sources
+            .http
+            .into_iter()
+            .map(|(name, source)| MockableSource {
+                name,
+                url: normalize_optional(source.url),
+                fixture_path: source.fixture_path,
+                bearer_token_env: normalize_optional(source.bearer_token_env),
+            }),
+    );
+    sources.dns.extend(
+        file_sources
+            .dns
+            .into_iter()
+            .map(|(name, source)| DnsSource {
+                name,
+                fixture_path: source.fixture_path,
+            }),
+    );
+    sources.loki.extend(
+        file_sources
+            .loki
+            .into_iter()
+            .map(|(name, source)| MockableSource {
+                name,
+                url: normalize_optional(source.url),
+                fixture_path: source.fixture_path,
+                bearer_token_env: normalize_optional(source.bearer_token_env),
+            }),
+    );
+    sources.grafana.extend(
+        file_sources
+            .grafana
+            .into_iter()
+            .map(|(name, source)| MockableSource {
+                name,
+                url: normalize_optional(source.url),
+                fixture_path: source.fixture_path,
+                bearer_token_env: normalize_optional(source.bearer_token_env),
+            }),
+    );
+    sources
+        .kubernetes
+        .extend(
+            file_sources
+                .kubernetes
+                .into_iter()
+                .map(|(name, source)| KubernetesSource {
+                    name,
+                    url: normalize_optional(source.url),
+                    namespace: normalize_optional(source.namespace),
+                    fixture_path: source.fixture_path,
+                    bearer_token_env: normalize_optional(source.bearer_token_env),
+                }),
+        );
 }
 
 fn merge_env_config(config: &mut ResolvedConfig) {
@@ -421,6 +707,42 @@ retry_count = 2
 
 [output]
 format = "json"
+
+[investigation]
+max_iterations = 1
+max_tool_calls = 4
+max_duration_secs = 30
+
+[sources.inventory.local]
+path = "examples/minimal/inventory.yaml"
+
+[sources.runbook.local]
+dir = "examples/minimal/runbooks"
+
+[sources.prometheus.prod]
+url = "https://prometheus.example.com"
+fixture_path = "fixtures/prometheus.yaml"
+bearer_token_env = "PROM_TOKEN"
+
+[sources.github.main]
+api_url = "https://api.github.example.com"
+repo = "example/web"
+fixture_path = "fixtures/github.yaml"
+
+[sources.http.web]
+url = "https://web.example.com/health"
+
+[sources.dns.web]
+
+[sources.loki.prod]
+url = "https://loki.example.com"
+
+[sources.grafana.prod]
+url = "https://grafana.example.com"
+
+[sources.kubernetes.prod]
+url = "https://kubernetes.example.com"
+namespace = "default"
 "#
         )?;
 
@@ -438,6 +760,30 @@ format = "json"
         assert_eq!(config.cloudflare.model, "openai/gpt-4.1-mini");
         assert_eq!(config.cloudflare.endpoint, CloudflareEndpoint::Gateway);
         assert_eq!(config.output_format, OutputFormat::Json);
+        assert_eq!(config.investigation.max_iterations, 1);
+        assert_eq!(config.sources.inventory_files.len(), 1);
+        assert_eq!(config.sources.runbook_files.len(), 1);
+        assert_eq!(config.sources.prometheus[0].name, "prod");
+        assert_eq!(
+            config.sources.prometheus[0].bearer_token_env.as_deref(),
+            Some("PROM_TOKEN")
+        );
+        assert_eq!(
+            config.sources.github[0].api_url.as_deref(),
+            Some("https://api.github.example.com")
+        );
+        assert_eq!(
+            config.sources.github[0].repo.as_deref(),
+            Some("example/web")
+        );
+        assert_eq!(config.sources.http[0].name, "web");
+        assert_eq!(config.sources.dns[0].name, "web");
+        assert_eq!(config.sources.loki[0].name, "prod");
+        assert_eq!(config.sources.grafana[0].name, "prod");
+        assert_eq!(
+            config.sources.kubernetes[0].namespace.as_deref(),
+            Some("default")
+        );
         Ok(())
     }
 

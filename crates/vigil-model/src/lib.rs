@@ -407,6 +407,155 @@ pub struct EvidenceSource {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceKind {
+    InventoryFile,
+    RunbookFile,
+    Alertmanager,
+    Prometheus,
+    Github,
+    Http,
+    Dns,
+    Loki,
+    Grafana,
+    Kubernetes,
+}
+
+impl SourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InventoryFile => "inventory-file",
+            Self::RunbookFile => "runbook-file",
+            Self::Alertmanager => "alertmanager",
+            Self::Prometheus => "prometheus",
+            Self::Github => "github",
+            Self::Http => "http",
+            Self::Dns => "dns",
+            Self::Loki => "loki",
+            Self::Grafana => "grafana",
+            Self::Kubernetes => "kubernetes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Source {
+    pub id: String,
+    pub kind: SourceKind,
+    pub name: String,
+    pub read_only: bool,
+    #[serde(default)]
+    pub config: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    Inventory,
+    Runbook,
+    Alerts,
+    Metrics,
+    Changes,
+    Http,
+    Dns,
+    Logs,
+    Dashboards,
+    Kubernetes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Capability {
+    pub id: String,
+    pub kind: CapabilityKind,
+    pub source_id: String,
+    pub adapter: SourceKind,
+    pub read_only: bool,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: BTreeMap<String, String>,
+    pub risk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub capability_id: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ToolPlan {
+    pub id: String,
+    pub rationale: String,
+    #[serde(default)]
+    pub calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    Succeeded,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub capability_id: String,
+    pub source_id: String,
+    pub status: ToolResultStatus,
+    pub started_at: String,
+    pub completed_at: String,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct InvestigationBudget {
+    pub max_iterations: u32,
+    pub max_tool_calls: u32,
+    pub max_duration_secs: u64,
+}
+
+impl Default for InvestigationBudget {
+    fn default() -> Self {
+        Self {
+            max_iterations: 2,
+            max_tool_calls: 8,
+            max_duration_secs: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct InvestigationIteration {
+    pub index: u32,
+    pub plan: ToolPlan,
+    #[serde(default)]
+    pub results: Vec<ToolResult>,
+    #[serde(default)]
+    pub reasoning_result: Option<ReasoningResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct InvestigationLoop {
+    pub budget: InvestigationBudget,
+    #[serde(default)]
+    pub iterations: Vec<InvestigationIteration>,
+    pub stop_reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct EvidencePacket {
     pub investigation_id: String,
@@ -552,6 +701,12 @@ pub struct Trajectory {
     pub completed_at: String,
     pub inputs: TrajectoryInputs,
     #[serde(default)]
+    pub sources: Vec<Source>,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub investigation_loop: Option<InvestigationLoop>,
+    #[serde(default)]
     pub resolved_targets: Vec<Target>,
     pub evidence_packet: EvidencePacket,
     #[serde(default)]
@@ -595,10 +750,20 @@ pub fn reasoning_result_schema() -> Result<Value, ModelError> {
     serde_json::to_value(schema_for!(ReasoningResult)).map_err(ModelError::InvalidJson)
 }
 
+pub fn tool_plan_schema() -> Result<Value, ModelError> {
+    serde_json::to_value(schema_for!(ToolPlan)).map_err(ModelError::InvalidJson)
+}
+
 pub fn parse_reasoning_result_str(content: &str) -> Result<ReasoningResult, ModelError> {
     let json_text = strip_json_fence(content);
     let value: Value = serde_json::from_str(&json_text)?;
     parse_reasoning_result_value(&value)
+}
+
+pub fn parse_tool_plan_str(content: &str) -> Result<ToolPlan, ModelError> {
+    let json_text = strip_json_fence(content);
+    let value: Value = serde_json::from_str(&json_text)?;
+    parse_tool_plan_value(&value)
 }
 
 pub fn parse_reasoning_result_value(value: &Value) -> Result<ReasoningResult, ModelError> {
@@ -606,6 +771,13 @@ pub fn parse_reasoning_result_value(value: &Value) -> Result<ReasoningResult, Mo
     let result: ReasoningResult = serde_json::from_value(value.clone())?;
     validate_reasoning_result(&result)?;
     Ok(result)
+}
+
+pub fn parse_tool_plan_value(value: &Value) -> Result<ToolPlan, ModelError> {
+    validate_tool_plan_schema(value)?;
+    let plan: ToolPlan = serde_json::from_value(value.clone())?;
+    validate_tool_plan_model(&plan)?;
+    Ok(plan)
 }
 
 pub fn validate_reasoning_schema(value: &Value) -> Result<(), ModelError> {
@@ -622,6 +794,73 @@ pub fn validate_reasoning_schema(value: &Value) -> Result<(), ModelError> {
     }
 
     Ok(())
+}
+
+pub fn validate_tool_plan_schema(value: &Value) -> Result<(), ModelError> {
+    let schema = tool_plan_schema()?;
+    let compiled = jsonschema::JSONSchema::compile(&schema)
+        .map_err(|err| ModelError::SchemaCompile(err.to_string()))?;
+
+    if let Err(errors) = compiled.validate(value) {
+        let messages = errors
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ModelError::SchemaValidation(messages));
+    }
+
+    Ok(())
+}
+
+pub fn validate_tool_plan_model(plan: &ToolPlan) -> Result<(), ModelError> {
+    let mut errors = Vec::new();
+
+    if plan.id.trim().is_empty() {
+        errors.push("tool_plan.id must not be empty".to_string());
+    }
+    if plan.rationale.trim().is_empty() {
+        errors.push(format!(
+            "tool_plan '{}' rationale must not be empty",
+            plan.id
+        ));
+    }
+
+    let mut seen_call_ids = BTreeSet::new();
+    for call in &plan.calls {
+        if call.id.trim().is_empty() {
+            errors.push("tool_call.id must not be empty".to_string());
+        }
+        if !seen_call_ids.insert(call.id.clone()) {
+            errors.push(format!("tool_call '{}' is duplicated", call.id));
+        }
+        if call.capability_id.trim().is_empty() {
+            errors.push(format!(
+                "tool_call '{}' capability_id must not be empty",
+                call.id
+            ));
+        }
+        if call.source_id.trim().is_empty() {
+            errors.push(format!(
+                "tool_call '{}' source_id must not be empty",
+                call.id
+            ));
+        }
+        if call.reason.trim().is_empty() {
+            errors.push(format!("tool_call '{}' reason must not be empty", call.id));
+        }
+        if contains_command_like_text(&call.reason) {
+            errors.push(format!(
+                "tool_call '{}' reason must describe a read-only check without runnable shell commands",
+                call.id
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ModelError::SemanticValidation(errors.join("; ")))
+    }
 }
 
 pub fn validate_reasoning_result(result: &ReasoningResult) -> Result<(), ModelError> {
@@ -792,6 +1031,24 @@ mod tests {
         })
     }
 
+    fn valid_tool_plan_json() -> Value {
+        serde_json::json!({
+            "id": "plan-1",
+            "rationale": "Collect read-only telemetry and changes.",
+            "calls": [{
+                "id": "tool-1",
+                "capability_id": "prometheus_query",
+                "source_id": "prometheus:prod",
+                "target": "service:web",
+                "since": "30m",
+                "reason": "Confirm recent error-rate telemetry.",
+                "inputs": {
+                    "query": "sum(rate(http_requests_total[5m]))"
+                }
+            }]
+        })
+    }
+
     #[test]
     fn serializes_models() -> Result<(), Box<dyn std::error::Error>> {
         let target = Target {
@@ -840,6 +1097,27 @@ mod tests {
             Value::String("kubectl get pods -n prod".to_string());
 
         let error = parse_reasoning_result_value(&value).err();
+        assert!(matches!(
+            error,
+            Some(ModelError::SemanticValidation(message))
+                if message.contains("without runnable shell commands")
+        ));
+    }
+
+    #[test]
+    fn validates_tool_plan_schema_and_semantics() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = parse_tool_plan_value(&valid_tool_plan_json())?;
+        assert_eq!(plan.calls.len(), 1);
+        assert_eq!(plan.calls[0].capability_id, "prometheus_query");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_command_like_tool_plan_reason() {
+        let mut value = valid_tool_plan_json();
+        value["calls"][0]["reason"] = Value::String("kubectl get pods".to_string());
+
+        let error = parse_tool_plan_value(&value).err();
         assert!(matches!(
             error,
             Some(ModelError::SemanticValidation(message))

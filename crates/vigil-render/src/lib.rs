@@ -1,6 +1,6 @@
 use serde::Serialize;
 use thiserror::Error;
-use vigil_model::{EvidenceBrief, SourceReference, Trajectory};
+use vigil_model::{EvidenceBrief, SourceReference, ToolPlan, Trajectory};
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -162,6 +162,37 @@ pub fn render_json<T: Serialize>(value: &T) -> Result<String, RenderError> {
 
 pub fn render_trajectory_json(trajectory: &Trajectory) -> Result<String, RenderError> {
     render_json(trajectory)
+}
+
+pub fn render_tool_plan(plan: &ToolPlan) -> String {
+    let mut out = String::new();
+    push_heading(&mut out, 1, "Planned Read-Only Collection");
+    if plan.rationale.trim().is_empty() {
+        push_paragraph(&mut out, "No planning rationale was provided.");
+    } else {
+        push_paragraph(&mut out, &plan.rationale);
+    }
+
+    if plan.calls.is_empty() {
+        push_bullet(&mut out, "No read-only tool calls were proposed.");
+    } else {
+        for call in &plan.calls {
+            let mut parts = vec![
+                format!("`{}`", call.capability_id),
+                format!("source: `{}`", call.source_id),
+            ];
+            if let Some(target) = &call.target {
+                parts.push(format!("target: `{target}`"));
+            }
+            if let Some(since) = &call.since {
+                parts.push(format!("since: `{since}`"));
+            }
+            parts.push(format!("reason: {}", call.reason));
+            push_bullet(&mut out, &parts.join(" - "));
+        }
+    }
+
+    out
 }
 
 fn push_heading(out: &mut String, level: usize, text: &str) {

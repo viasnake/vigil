@@ -1,19 +1,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
+    net::ToSocketAddrs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
 use thiserror::Error;
 use uuid::Uuid;
 use vigil_llm::{LlmError, LlmProvider, ProviderResponse};
 use vigil_model::{
-    validate_reasoning_result, Alert, CaseManifest, Evidence, EvidenceBrief, EvidenceKind,
-    EvidencePacket, EvidenceSource, Hypothesis, Inventory, InvestigationConstraints,
-    LlmExchangeMetadata, MissingCheck, ReasoningResult, RecommendedCheck, RedactionReport, Runbook,
-    SourceReference, Target, TargetKind, Trajectory, TrajectoryInputs,
+    validate_reasoning_result, validate_tool_plan_model, Alert, Capability, CapabilityKind,
+    CaseManifest, Evidence, EvidenceBrief, EvidenceKind, EvidencePacket, EvidenceSource,
+    Hypothesis, Inventory, InvestigationBudget, InvestigationConstraints, InvestigationIteration,
+    InvestigationLoop, LlmExchangeMetadata, MissingCheck, ReasoningResult, RecommendedCheck,
+    RedactionReport, Runbook, Source, SourceKind, SourceReference, Target, TargetKind, ToolCall,
+    ToolPlan, ToolResult, ToolResultStatus, Trajectory, TrajectoryInputs,
 };
 
 #[derive(Debug, Error)]
@@ -92,6 +96,8 @@ pub enum CoreError {
     Redaction(String),
     #[error("deterministic reasoning result failed validation: {0}")]
     DeterministicReasoning(String),
+    #[error("investigation plan failed policy validation: {0}")]
+    PolicyValidation(String),
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +123,165 @@ pub struct ValidationRequest {
 pub struct InvestigationOutcome {
     pub brief: EvidenceBrief,
     pub trajectory: Trajectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvestigationSelector {
+    Target(String),
+    Alert(String),
+}
+
+impl InvestigationSelector {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Target(value) | Self::Alert(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentInvestigationRequest {
+    pub selector: InvestigationSelector,
+    pub since: Option<String>,
+    pub sources: Vec<SourceConfig>,
+    pub source_filters: Vec<String>,
+    pub budget: InvestigationBudget,
+    pub no_llm: bool,
+    pub dry_run: bool,
+    pub plan_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SourceConfig {
+    InventoryFile {
+        name: String,
+        path: Option<PathBuf>,
+    },
+    RunbookFile {
+        name: String,
+        dir: Option<PathBuf>,
+        paths: Vec<PathBuf>,
+    },
+    Alertmanager {
+        name: String,
+        url: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+    Prometheus {
+        name: String,
+        url: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+    Github {
+        name: String,
+        api_url: Option<String>,
+        repo: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+    Http {
+        name: String,
+        url: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+    Dns {
+        name: String,
+        fixture_path: Option<PathBuf>,
+    },
+    Loki {
+        name: String,
+        url: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+    Grafana {
+        name: String,
+        url: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+    Kubernetes {
+        name: String,
+        url: Option<String>,
+        namespace: Option<String>,
+        fixture_path: Option<PathBuf>,
+        bearer_token_env: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanOnlyOutcome {
+    pub plan: ToolPlan,
+    pub sources: Vec<Source>,
+    pub capabilities: Vec<Capability>,
+    pub warnings: Vec<String>,
+}
+
+impl SourceConfig {
+    fn source_kind(&self) -> SourceKind {
+        match self {
+            Self::InventoryFile { .. } => SourceKind::InventoryFile,
+            Self::RunbookFile { .. } => SourceKind::RunbookFile,
+            Self::Alertmanager { .. } => SourceKind::Alertmanager,
+            Self::Prometheus { .. } => SourceKind::Prometheus,
+            Self::Github { .. } => SourceKind::Github,
+            Self::Http { .. } => SourceKind::Http,
+            Self::Dns { .. } => SourceKind::Dns,
+            Self::Loki { .. } => SourceKind::Loki,
+            Self::Grafana { .. } => SourceKind::Grafana,
+            Self::Kubernetes { .. } => SourceKind::Kubernetes,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::InventoryFile { name, .. }
+            | Self::RunbookFile { name, .. }
+            | Self::Alertmanager { name, .. }
+            | Self::Prometheus { name, .. }
+            | Self::Github { name, .. }
+            | Self::Http { name, .. }
+            | Self::Dns { name, .. }
+            | Self::Loki { name, .. }
+            | Self::Grafana { name, .. }
+            | Self::Kubernetes { name, .. } => name,
+        }
+    }
+
+    fn source_id(&self) -> String {
+        format!("{}:{}", self.source_kind().as_str(), self.name())
+    }
+
+    fn matches_filter(&self, filter: &str) -> bool {
+        let source_id = self.source_id();
+        let kind = self.source_kind();
+        filter == source_id
+            || filter == self.name()
+            || filter == kind.as_str()
+            || filter
+                .split_once(':')
+                .is_some_and(|(filter_kind, filter_name)| {
+                    filter_kind == kind.as_str() && filter_name == self.name()
+                })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedAgentInvestigation {
+    investigation_id: String,
+    packet: EvidencePacket,
+    resolved_targets: Vec<Target>,
+    source_configs: Vec<SourceConfig>,
+    sources: Vec<Source>,
+    capabilities: Vec<Capability>,
+    warnings: Vec<String>,
+    primary_inventory_path: Option<String>,
+    primary_runbook_dir: Option<String>,
+    runbook_paths: Vec<String>,
+    llm_metadata: Option<LlmExchangeMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,12 +403,188 @@ pub async fn investigate(
             runbook_dir: request.runbook_dir.as_deref().map(display_path),
             target: request.target.clone(),
         },
+        sources: Vec::new(),
+        capabilities: Vec::new(),
+        investigation_loop: None,
         resolved_targets,
         evidence_packet: packet,
         reasoning_result: Some(reasoning_result),
         brief: brief.clone(),
         llm: llm_metadata,
         warnings,
+        errors: Vec::new(),
+    };
+
+    Ok(InvestigationOutcome { brief, trajectory })
+}
+
+pub async fn plan_agent_investigation(
+    request: AgentInvestigationRequest,
+    provider: Option<&dyn LlmProvider>,
+) -> Result<PlanOnlyOutcome, CoreError> {
+    let prepared = prepare_agent_investigation(&request)?;
+    let (plan, _planning_reasoning, _planning_metadata) = plan_next_read_only_actions(
+        &prepared.packet,
+        &prepared.capabilities,
+        &request,
+        provider,
+        1,
+    )
+    .await?;
+    validate_tool_plan(&plan, &prepared.sources, &prepared.capabilities)?;
+
+    Ok(PlanOnlyOutcome {
+        plan,
+        sources: prepared.sources,
+        capabilities: prepared.capabilities,
+        warnings: prepared.warnings,
+    })
+}
+
+pub async fn investigate_agent(
+    request: AgentInvestigationRequest,
+    provider: Option<&dyn LlmProvider>,
+) -> Result<InvestigationOutcome, CoreError> {
+    let started_at = Utc::now().to_rfc3339();
+    let mut prepared = prepare_agent_investigation(&request)?;
+    let investigation_id = prepared.investigation_id.clone();
+    let resolved_targets = prepared.resolved_targets.clone();
+    let mut warnings = prepared.warnings.clone();
+    let mut loop_record = InvestigationLoop {
+        budget: request.budget.clone(),
+        iterations: Vec::new(),
+        stop_reason: "investigation loop did not run".to_string(),
+    };
+    let loop_started = Instant::now();
+    let mut executed_keys = BTreeSet::new();
+    let mut total_tool_calls = 0_u32;
+
+    if request.plan_only {
+        loop_record.stop_reason = "plan-only mode requested; no tools were executed".to_string();
+    } else {
+        for iteration in 1..=request.budget.max_iterations {
+            if loop_started.elapsed().as_secs() >= request.budget.max_duration_secs {
+                loop_record.stop_reason = "duration budget exhausted".to_string();
+                break;
+            }
+            if total_tool_calls >= request.budget.max_tool_calls {
+                loop_record.stop_reason = "tool-call budget exhausted".to_string();
+                break;
+            }
+
+            let (mut plan, planning_reasoning, planning_metadata) = plan_next_read_only_actions(
+                &prepared.packet,
+                &prepared.capabilities,
+                &request,
+                provider,
+                iteration,
+            )
+            .await?;
+            if let Some(metadata) = planning_metadata {
+                prepared.llm_metadata = Some(metadata);
+            }
+
+            plan.calls.retain(|call| {
+                let key = tool_call_dedupe_key(call);
+                !executed_keys.contains(&key)
+            });
+            let remaining = (request.budget.max_tool_calls - total_tool_calls) as usize;
+            plan.calls.truncate(remaining);
+            validate_tool_plan(&plan, &prepared.sources, &prepared.capabilities)?;
+
+            if plan.calls.is_empty() {
+                loop_record.stop_reason = "no useful new read-only checks remain".to_string();
+                loop_record.iterations.push(InvestigationIteration {
+                    index: iteration,
+                    plan,
+                    results: Vec::new(),
+                    reasoning_result: planning_reasoning,
+                });
+                break;
+            }
+
+            let mut results = Vec::new();
+            let mut collected_evidence = Vec::new();
+            for call in &plan.calls {
+                executed_keys.insert(tool_call_dedupe_key(call));
+                let result = execute_read_only_tool(call, &prepared.source_configs).await?;
+                if result.status == ToolResultStatus::Succeeded {
+                    collected_evidence.extend(result.evidence.clone());
+                }
+                results.push(result);
+            }
+
+            total_tool_calls += plan.calls.len() as u32;
+            let collected_count = collected_evidence.len();
+            prepared.packet.evidence.extend(collected_evidence);
+            prepared.packet = redact_evidence_packet(prepared.packet)?;
+
+            loop_record.iterations.push(InvestigationIteration {
+                index: iteration,
+                plan,
+                results,
+                reasoning_result: planning_reasoning,
+            });
+
+            if collected_count == 0 {
+                loop_record.stop_reason =
+                    "read-only checks produced no additional evidence".to_string();
+                break;
+            }
+            if iteration == request.budget.max_iterations {
+                loop_record.stop_reason = "iteration budget exhausted".to_string();
+            }
+        }
+    }
+
+    warnings.extend(prepared.packet.redaction.warnings.clone());
+    if request.no_llm {
+        warnings.push("--no-llm was used; planning and reasoning are deterministic.".to_string());
+    }
+    if request.dry_run {
+        warnings.push("--dry-run was used; no LLM request was sent.".to_string());
+    }
+
+    let (reasoning_result, llm_metadata) = if request.no_llm || request.dry_run {
+        (
+            deterministic_reasoning(&prepared.packet)?,
+            prepared.llm_metadata,
+        )
+    } else {
+        let provider = provider.ok_or(CoreError::MissingProvider)?;
+        let response = provider.reason(&prepared.packet).await?;
+        provider_response_parts(response)
+    };
+
+    let brief = build_brief(&prepared.packet, &reasoning_result, &warnings);
+    let completed_at = Utc::now().to_rfc3339();
+    let trajectory = Trajectory {
+        id: investigation_id,
+        started_at,
+        completed_at,
+        inputs: TrajectoryInputs {
+            case_dir: None,
+            alert: match &request.selector {
+                InvestigationSelector::Alert(name) => Some(name.clone()),
+                InvestigationSelector::Target(_) => None,
+            },
+            inventory: prepared.primary_inventory_path.clone(),
+            runbooks: prepared.runbook_paths.clone(),
+            runbook_dir: prepared.primary_runbook_dir.clone(),
+            target: match &request.selector {
+                InvestigationSelector::Target(target) => Some(target.clone()),
+                InvestigationSelector::Alert(_) => None,
+            },
+        },
+        sources: prepared.sources,
+        capabilities: prepared.capabilities,
+        investigation_loop: Some(loop_record),
+        resolved_targets,
+        evidence_packet: prepared.packet,
+        reasoning_result: Some(reasoning_result),
+        brief: brief.clone(),
+        llm: llm_metadata,
+        warnings: dedup_strings(warnings),
         errors: Vec::new(),
     };
 
@@ -428,6 +769,9 @@ pub async fn investigate_case(
             runbook_dir: Some(display_path(&runbook_dir)),
             target: Some(manifest.target),
         },
+        sources: Vec::new(),
+        capabilities: Vec::new(),
+        investigation_loop: None,
         resolved_targets: vec![target],
         evidence_packet: packet,
         reasoning_result: Some(reasoning_result),
@@ -458,6 +802,1866 @@ pub fn load_trajectory(path: &Path) -> Result<Trajectory, CoreError> {
         path: path.display().to_string(),
         source,
     })
+}
+
+fn prepare_agent_investigation(
+    request: &AgentInvestigationRequest,
+) -> Result<PreparedAgentInvestigation, CoreError> {
+    let investigation_id = Uuid::now_v7().to_string();
+    let source_configs = filtered_or_default_sources(request);
+    let sources = source_configs
+        .iter()
+        .map(source_from_config)
+        .collect::<Vec<_>>();
+    let capabilities = source_configs
+        .iter()
+        .map(capability_from_config)
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+
+    let inventory = load_agent_inventory(&source_configs, &mut warnings)?;
+    let runbooks = load_agent_runbooks(&source_configs, &mut warnings)?;
+    let alert = match &request.selector {
+        InvestigationSelector::Alert(name) => Some(selector_alert(name)),
+        InvestigationSelector::Target(_) => None,
+    };
+    let resolved_targets = match &request.selector {
+        InvestigationSelector::Target(target) => {
+            resolve_targets(alert.as_ref(), &inventory, Some(target))
+        }
+        InvestigationSelector::Alert(name) => {
+            let targets = resolve_targets(alert.as_ref(), &inventory, None);
+            if targets.is_empty() {
+                vec![unknown_target(&format!("alert:{name}"))]
+            } else {
+                targets
+            }
+        }
+    };
+    let evidence = build_evidence(alert.as_ref(), &inventory, &resolved_targets, &runbooks)?;
+    let packet = EvidencePacket {
+        investigation_id: investigation_id.clone(),
+        question: agent_investigation_question(&request.selector, request.since.as_deref()),
+        targets: resolved_targets.clone(),
+        alerts: alert.iter().cloned().collect(),
+        evidence,
+        runbooks: matching_runbooks(&runbooks, &resolved_targets),
+        constraints: InvestigationConstraints::default(),
+        redaction: RedactionReport::default(),
+        metadata: BTreeMap::from([
+            ("tool".to_string(), Value::String("vigil".to_string())),
+            ("mode".to_string(), Value::String("agent".to_string())),
+            (
+                "selector".to_string(),
+                Value::String(request.selector.label().to_string()),
+            ),
+            (
+                "selector_kind".to_string(),
+                Value::String(match &request.selector {
+                    InvestigationSelector::Target(_) => "target".to_string(),
+                    InvestigationSelector::Alert(_) => "alert".to_string(),
+                }),
+            ),
+            (
+                "since".to_string(),
+                Value::String(
+                    request
+                        .since
+                        .clone()
+                        .unwrap_or_else(|| "unspecified".to_string()),
+                ),
+            ),
+        ]),
+    };
+    let packet = redact_evidence_packet(packet)?;
+    warnings.extend(packet.redaction.warnings.clone());
+
+    Ok(PreparedAgentInvestigation {
+        investigation_id,
+        packet,
+        resolved_targets,
+        primary_inventory_path: first_inventory_path(&source_configs),
+        primary_runbook_dir: first_runbook_dir(&source_configs),
+        runbook_paths: configured_runbook_paths(&source_configs),
+        source_configs,
+        sources,
+        capabilities,
+        warnings,
+        llm_metadata: None,
+    })
+}
+
+fn filtered_or_default_sources(request: &AgentInvestigationRequest) -> Vec<SourceConfig> {
+    let mut sources = if request.sources.is_empty() {
+        default_agent_sources()
+    } else {
+        request.sources.clone()
+    };
+
+    if !request.source_filters.is_empty() {
+        sources.retain(|source| {
+            request
+                .source_filters
+                .iter()
+                .any(|filter| source.matches_filter(filter))
+        });
+    }
+
+    sources
+}
+
+fn default_agent_sources() -> Vec<SourceConfig> {
+    vec![
+        SourceConfig::InventoryFile {
+            name: "local".to_string(),
+            path: Some(PathBuf::from("inventory.yaml")),
+        },
+        SourceConfig::RunbookFile {
+            name: "local".to_string(),
+            dir: Some(PathBuf::from("runbooks")),
+            paths: Vec::new(),
+        },
+        SourceConfig::Alertmanager {
+            name: "default".to_string(),
+            url: None,
+            fixture_path: None,
+            bearer_token_env: None,
+        },
+        SourceConfig::Prometheus {
+            name: "default".to_string(),
+            url: None,
+            fixture_path: None,
+            bearer_token_env: None,
+        },
+        SourceConfig::Github {
+            name: "default".to_string(),
+            api_url: None,
+            repo: None,
+            fixture_path: None,
+            bearer_token_env: None,
+        },
+    ]
+}
+
+fn source_from_config(config: &SourceConfig) -> Source {
+    Source {
+        id: config.source_id(),
+        kind: config.source_kind(),
+        name: config.name().to_string(),
+        read_only: true,
+        config: redacted_source_config(config),
+    }
+}
+
+fn redacted_source_config(config: &SourceConfig) -> BTreeMap<String, Value> {
+    match config {
+        SourceConfig::InventoryFile { path, .. } => optional_path_config("path", path.as_deref()),
+        SourceConfig::RunbookFile { dir, paths, .. } => {
+            let mut values = optional_path_config("dir", dir.as_deref());
+            if !paths.is_empty() {
+                values.insert(
+                    "paths".to_string(),
+                    Value::Array(
+                        paths
+                            .iter()
+                            .map(|path| Value::String(path.display().to_string()))
+                            .collect(),
+                    ),
+                );
+            }
+            values
+        }
+        SourceConfig::Alertmanager {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }
+        | SourceConfig::Prometheus {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }
+        | SourceConfig::Http {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }
+        | SourceConfig::Loki {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }
+        | SourceConfig::Grafana {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        } => {
+            let mut values = BTreeMap::new();
+            if let Some(url) = url {
+                values.insert("url".to_string(), Value::String(url.clone()));
+            }
+            if let Some(path) = fixture_path {
+                values.insert(
+                    "fixture_path".to_string(),
+                    Value::String(path.display().to_string()),
+                );
+            }
+            if let Some(env_name) = bearer_token_env {
+                values.insert(
+                    "bearer_token_env".to_string(),
+                    Value::String(env_name.clone()),
+                );
+            }
+            values
+        }
+        SourceConfig::Github {
+            api_url,
+            repo,
+            fixture_path,
+            bearer_token_env,
+            ..
+        } => {
+            let mut values = BTreeMap::new();
+            if let Some(api_url) = api_url {
+                values.insert("api_url".to_string(), Value::String(api_url.clone()));
+            }
+            if let Some(repo) = repo {
+                values.insert("repo".to_string(), Value::String(repo.clone()));
+            }
+            if let Some(path) = fixture_path {
+                values.insert(
+                    "fixture_path".to_string(),
+                    Value::String(path.display().to_string()),
+                );
+            }
+            if let Some(env_name) = bearer_token_env {
+                values.insert(
+                    "bearer_token_env".to_string(),
+                    Value::String(env_name.clone()),
+                );
+            }
+            values
+        }
+        SourceConfig::Dns { fixture_path, .. } => {
+            let mut values = BTreeMap::new();
+            if let Some(path) = fixture_path {
+                values.insert(
+                    "fixture_path".to_string(),
+                    Value::String(path.display().to_string()),
+                );
+            }
+            values
+        }
+        SourceConfig::Kubernetes {
+            url,
+            namespace,
+            fixture_path,
+            bearer_token_env,
+            ..
+        } => {
+            let mut values = BTreeMap::new();
+            if let Some(url) = url {
+                values.insert("url".to_string(), Value::String(url.clone()));
+            }
+            if let Some(namespace) = namespace {
+                values.insert("namespace".to_string(), Value::String(namespace.clone()));
+            }
+            if let Some(path) = fixture_path {
+                values.insert(
+                    "fixture_path".to_string(),
+                    Value::String(path.display().to_string()),
+                );
+            }
+            if let Some(env_name) = bearer_token_env {
+                values.insert(
+                    "bearer_token_env".to_string(),
+                    Value::String(env_name.clone()),
+                );
+            }
+            values
+        }
+    }
+}
+
+fn optional_path_config(key: &str, path: Option<&Path>) -> BTreeMap<String, Value> {
+    path.map(|path| BTreeMap::from([(key.to_string(), Value::String(display_path(path)))]))
+        .unwrap_or_default()
+}
+
+fn capability_from_config(config: &SourceConfig) -> Capability {
+    let (id, kind, description, input_schema) = match config {
+        SourceConfig::InventoryFile { .. } => (
+            "inventory_lookup",
+            CapabilityKind::Inventory,
+            "Resolve target metadata from a local inventory file.",
+            BTreeMap::from([("target".to_string(), "string".to_string())]),
+        ),
+        SourceConfig::RunbookFile { .. } => (
+            "runbook_lookup",
+            CapabilityKind::Runbook,
+            "Find matching local runbooks and read-only checks.",
+            BTreeMap::from([("target".to_string(), "string".to_string())]),
+        ),
+        SourceConfig::Alertmanager { .. } => (
+            "alertmanager_active_alerts",
+            CapabilityKind::Alerts,
+            "Read active alerts and alert metadata.",
+            BTreeMap::from([("matcher".to_string(), "string".to_string())]),
+        ),
+        SourceConfig::Prometheus { .. } => (
+            "prometheus_query",
+            CapabilityKind::Metrics,
+            "Read Prometheus metric data for the investigation window.",
+            BTreeMap::from([
+                ("query".to_string(), "string".to_string()),
+                ("since".to_string(), "duration".to_string()),
+            ]),
+        ),
+        SourceConfig::Github { .. } => (
+            "github_recent_changes",
+            CapabilityKind::Changes,
+            "Read recent GitHub changes for a configured repository.",
+            BTreeMap::from([
+                ("repo".to_string(), "string".to_string()),
+                ("since".to_string(), "duration".to_string()),
+            ]),
+        ),
+        SourceConfig::Http { .. } => (
+            "http_check",
+            CapabilityKind::Http,
+            "Read an HTTP endpoint status and response metadata.",
+            BTreeMap::from([
+                ("url".to_string(), "string".to_string()),
+                ("method".to_string(), "string".to_string()),
+            ]),
+        ),
+        SourceConfig::Dns { .. } => (
+            "dns_lookup",
+            CapabilityKind::Dns,
+            "Resolve DNS addresses for a target host.",
+            BTreeMap::from([("host".to_string(), "string".to_string())]),
+        ),
+        SourceConfig::Loki { .. } => (
+            "loki_query_range",
+            CapabilityKind::Logs,
+            "Read Loki log entries for the investigation window.",
+            BTreeMap::from([
+                ("query".to_string(), "string".to_string()),
+                ("since".to_string(), "duration".to_string()),
+                ("limit".to_string(), "integer".to_string()),
+            ]),
+        ),
+        SourceConfig::Grafana { .. } => (
+            "grafana_annotations",
+            CapabilityKind::Dashboards,
+            "Read Grafana annotations for the investigation window.",
+            BTreeMap::from([
+                ("tags".to_string(), "array".to_string()),
+                ("since".to_string(), "duration".to_string()),
+            ]),
+        ),
+        SourceConfig::Kubernetes { .. } => (
+            "kubernetes_events",
+            CapabilityKind::Kubernetes,
+            "Read Kubernetes events from a configured API endpoint.",
+            BTreeMap::from([
+                ("namespace".to_string(), "string".to_string()),
+                ("field_selector".to_string(), "string".to_string()),
+                ("limit".to_string(), "integer".to_string()),
+            ]),
+        ),
+    };
+
+    Capability {
+        id: id.to_string(),
+        kind,
+        source_id: config.source_id(),
+        adapter: config.source_kind(),
+        read_only: true,
+        description: description.to_string(),
+        input_schema,
+        risk: "low".to_string(),
+    }
+}
+
+fn load_agent_inventory(
+    configs: &[SourceConfig],
+    warnings: &mut Vec<String>,
+) -> Result<Inventory, CoreError> {
+    for config in configs {
+        let SourceConfig::InventoryFile {
+            path: Some(path), ..
+        } = config
+        else {
+            continue;
+        };
+        if path.is_file() {
+            return load_inventory(path);
+        }
+        warnings.push(format!(
+            "Inventory source '{}' did not find readable file '{}'.",
+            config.source_id(),
+            path.display()
+        ));
+    }
+
+    warnings
+        .push("No inventory file source loaded; target resolution may be incomplete.".to_string());
+    Ok(Inventory::default())
+}
+
+fn load_agent_runbooks(
+    configs: &[SourceConfig],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Runbook>, CoreError> {
+    let mut all_runbooks = Vec::new();
+    for config in configs {
+        let SourceConfig::RunbookFile { dir, paths, .. } = config else {
+            continue;
+        };
+        if let Some(dir) = dir {
+            if dir.is_dir() {
+                all_runbooks.extend(load_runbooks(paths, Some(dir))?);
+            } else {
+                warnings.push(format!(
+                    "Runbook source '{}' did not find directory '{}'.",
+                    config.source_id(),
+                    dir.display()
+                ));
+                all_runbooks.extend(load_runbooks(paths, None)?);
+            }
+        } else {
+            all_runbooks.extend(load_runbooks(paths, None)?);
+        }
+    }
+    Ok(all_runbooks)
+}
+
+fn first_inventory_path(configs: &[SourceConfig]) -> Option<String> {
+    configs.iter().find_map(|config| match config {
+        SourceConfig::InventoryFile {
+            path: Some(path), ..
+        } => Some(display_path(path)),
+        _ => None,
+    })
+}
+
+fn first_runbook_dir(configs: &[SourceConfig]) -> Option<String> {
+    configs.iter().find_map(|config| match config {
+        SourceConfig::RunbookFile {
+            dir: Some(path), ..
+        } => Some(display_path(path)),
+        _ => None,
+    })
+}
+
+fn configured_runbook_paths(configs: &[SourceConfig]) -> Vec<String> {
+    configs
+        .iter()
+        .flat_map(|config| match config {
+            SourceConfig::RunbookFile { paths, .. } => paths
+                .iter()
+                .map(|path| display_path(path))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn selector_alert(name: &str) -> Alert {
+    Alert {
+        id: slug_id(name),
+        name: name.to_string(),
+        severity: "unknown".to_string(),
+        status: "requested".to_string(),
+        summary: format!("Investigation requested for alert '{name}'."),
+        description: None,
+        target: None,
+        started_at: None,
+        ended_at: None,
+        labels: BTreeMap::from([("alertname".to_string(), name.to_string())]),
+        annotations: BTreeMap::new(),
+        source: Some("selector".to_string()),
+    }
+}
+
+fn slug_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn agent_investigation_question(selector: &InvestigationSelector, since: Option<&str>) -> String {
+    let window = since
+        .map(|since| format!(" over the last {since}"))
+        .unwrap_or_default();
+    match selector {
+        InvestigationSelector::Target(target) => {
+            format!("Investigate target '{target}'{window} with bounded read-only tools.")
+        }
+        InvestigationSelector::Alert(alert) => {
+            format!("Investigate alert '{alert}'{window} with bounded read-only tools.")
+        }
+    }
+}
+
+async fn plan_next_read_only_actions(
+    packet: &EvidencePacket,
+    capabilities: &[Capability],
+    request: &AgentInvestigationRequest,
+    provider: Option<&dyn LlmProvider>,
+    iteration: u32,
+) -> Result<
+    (
+        ToolPlan,
+        Option<ReasoningResult>,
+        Option<LlmExchangeMetadata>,
+    ),
+    CoreError,
+> {
+    if request.no_llm || request.dry_run || request.plan_only {
+        return Ok((
+            deterministic_tool_plan(packet, capabilities, request, iteration),
+            None,
+            None,
+        ));
+    }
+
+    let Some(provider) = provider else {
+        return Ok((
+            deterministic_tool_plan(packet, capabilities, request, iteration),
+            None,
+            None,
+        ));
+    };
+
+    let response = provider.plan(packet, capabilities).await?;
+    let mut plan = response.plan;
+    if plan.id.trim().is_empty() {
+        plan.id = format!("plan-{iteration}");
+    }
+    for (index, call) in plan.calls.iter_mut().enumerate() {
+        if call.id.trim().is_empty() {
+            call.id = format!("iter-{iteration}-tool-{}", index + 1);
+        }
+        if call.since.is_none() {
+            call.since = request.since.clone();
+        }
+        if call.target.is_none() {
+            call.target = packet.targets.first().map(|target| target.id.clone());
+        }
+    }
+    let plan = if plan.calls.is_empty() && plan.rationale.trim().is_empty() {
+        deterministic_tool_plan(packet, capabilities, request, iteration)
+    } else {
+        plan
+    };
+
+    Ok((plan, None, Some(response.metadata)))
+}
+
+fn deterministic_tool_plan(
+    packet: &EvidencePacket,
+    capabilities: &[Capability],
+    request: &AgentInvestigationRequest,
+    iteration: u32,
+) -> ToolPlan {
+    let target_id = packet
+        .targets
+        .first()
+        .map(|target| target.id.clone())
+        .unwrap_or_else(|| request.selector.label().to_string());
+    let mut calls = Vec::new();
+
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "inventory_lookup",
+        &target_id,
+        request.since.as_deref(),
+        "Resolve current target metadata and dependencies.",
+        BTreeMap::from([("target".to_string(), Value::String(target_id.clone()))]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "runbook_lookup",
+        &target_id,
+        request.since.as_deref(),
+        "Ground the investigation in matching read-only runbook checks.",
+        BTreeMap::from([("target".to_string(), Value::String(target_id.clone()))]),
+    );
+    if let InvestigationSelector::Alert(alert_name) = &request.selector {
+        push_capability_call(
+            &mut calls,
+            capabilities,
+            "alertmanager_active_alerts",
+            &target_id,
+            request.since.as_deref(),
+            "Check whether the requested alert is active and inspect its labels.",
+            BTreeMap::from([(
+                "matcher".to_string(),
+                Value::String(format!("alertname={alert_name}")),
+            )]),
+        );
+    } else {
+        push_capability_call(
+            &mut calls,
+            capabilities,
+            "alertmanager_active_alerts",
+            &target_id,
+            request.since.as_deref(),
+            "Check active alerts for the target.",
+            BTreeMap::from([("matcher".to_string(), Value::String(target_id.clone()))]),
+        );
+    }
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "prometheus_query",
+        &target_id,
+        request.since.as_deref(),
+        "Check recent error-rate telemetry for the target.",
+        BTreeMap::from([(
+            "query".to_string(),
+            Value::String(default_error_rate_query(&target_id)),
+        )]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "prometheus_query",
+        &target_id,
+        request.since.as_deref(),
+        "Check recent latency telemetry for the target.",
+        BTreeMap::from([(
+            "query".to_string(),
+            Value::String(default_latency_query(&target_id)),
+        )]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "github_recent_changes",
+        &target_id,
+        request.since.as_deref(),
+        "Check recent repository changes that may correlate with the symptom.",
+        BTreeMap::from([("target".to_string(), Value::String(target_id.clone()))]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "http_check",
+        &target_id,
+        request.since.as_deref(),
+        "Check configured HTTP endpoint health without mutating production.",
+        BTreeMap::from([("target".to_string(), Value::String(target_id.clone()))]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "dns_lookup",
+        &target_id,
+        request.since.as_deref(),
+        "Resolve DNS for the target to check routing context.",
+        BTreeMap::from([(
+            "host".to_string(),
+            Value::String(target_name_for_query(&target_id)),
+        )]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "loki_query_range",
+        &target_id,
+        request.since.as_deref(),
+        "Check recent logs for target-related errors.",
+        BTreeMap::from([(
+            "query".to_string(),
+            Value::String(default_loki_query(&target_id)),
+        )]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "grafana_annotations",
+        &target_id,
+        request.since.as_deref(),
+        "Check Grafana annotations for recent operational events.",
+        BTreeMap::from([(
+            "tags".to_string(),
+            Value::Array(vec![Value::String(target_name_for_query(&target_id))]),
+        )]),
+    );
+    push_capability_call(
+        &mut calls,
+        capabilities,
+        "kubernetes_events",
+        &target_id,
+        request.since.as_deref(),
+        "Check Kubernetes events for workload-level context.",
+        BTreeMap::from([("target".to_string(), Value::String(target_id.clone()))]),
+    );
+
+    let calls = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut call)| {
+            call.id = format!("iter-{iteration}-tool-{}", index + 1);
+            call
+        })
+        .collect();
+
+    ToolPlan {
+        id: format!("plan-{iteration}"),
+        rationale:
+            "Deterministic planner selected registered read-only SRE investigation capabilities."
+                .to_string(),
+        calls,
+    }
+}
+
+fn push_capability_call(
+    calls: &mut Vec<ToolCall>,
+    capabilities: &[Capability],
+    capability_id: &str,
+    target: &str,
+    since: Option<&str>,
+    reason: &str,
+    inputs: BTreeMap<String, Value>,
+) {
+    let Some(capability) = capabilities.iter().find(|item| item.id == capability_id) else {
+        return;
+    };
+    calls.push(ToolCall {
+        id: String::new(),
+        capability_id: capability.id.clone(),
+        source_id: capability.source_id.clone(),
+        target: Some(target.to_string()),
+        since: since.map(ToOwned::to_owned),
+        reason: reason.to_string(),
+        inputs,
+    });
+}
+
+fn default_error_rate_query(target_id: &str) -> String {
+    let service = target_name_for_query(target_id);
+    format!("sum(rate(http_requests_total{{service=\"{service}\",status=~\"5..\"}}[5m]))")
+}
+
+fn default_latency_query(target_id: &str) -> String {
+    let service = target_name_for_query(target_id);
+    format!(
+        "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{service=\"{service}\"}}[5m])) by (le))"
+    )
+}
+
+fn default_loki_query(target_id: &str) -> String {
+    let service = target_name_for_query(target_id);
+    format!("{{service=\"{service}\"}}")
+}
+
+fn target_name_for_query(target_id: &str) -> String {
+    target_id
+        .split_once(':')
+        .map(|(_, value)| value)
+        .unwrap_or(target_id)
+        .replace('"', "")
+}
+
+fn validate_tool_plan(
+    plan: &ToolPlan,
+    sources: &[Source],
+    capabilities: &[Capability],
+) -> Result<(), CoreError> {
+    validate_tool_plan_model(plan).map_err(|err| CoreError::PolicyValidation(err.to_string()))?;
+    let mut errors = Vec::new();
+    for call in &plan.calls {
+        let Some(capability) = capabilities.iter().find(|capability| {
+            capability.id == call.capability_id && capability.source_id == call.source_id
+        }) else {
+            errors.push(format!(
+                "tool call '{}' references unregistered capability '{}' on source '{}'",
+                call.id, call.capability_id, call.source_id
+            ));
+            continue;
+        };
+        if !capability.read_only {
+            errors.push(format!(
+                "tool call '{}' references non-read-only capability '{}'",
+                call.id, call.capability_id
+            ));
+        }
+        let Some(source) = sources.iter().find(|source| source.id == call.source_id) else {
+            errors.push(format!(
+                "tool call '{}' references unregistered source '{}'",
+                call.id, call.source_id
+            ));
+            continue;
+        };
+        if !source.read_only {
+            errors.push(format!(
+                "tool call '{}' references non-read-only source '{}'",
+                call.id, call.source_id
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CoreError::PolicyValidation(errors.join("; ")))
+    }
+}
+
+async fn execute_read_only_tool(
+    call: &ToolCall,
+    configs: &[SourceConfig],
+) -> Result<ToolResult, CoreError> {
+    let started_at = Utc::now().to_rfc3339();
+    let result = match configs
+        .iter()
+        .find(|config| config.source_id() == call.source_id)
+    {
+        Some(SourceConfig::InventoryFile { path, .. }) => execute_inventory_lookup(call, path),
+        Some(SourceConfig::RunbookFile { dir, paths, .. }) => {
+            execute_runbook_lookup(call, dir.as_deref(), paths)
+        }
+        Some(SourceConfig::Alertmanager {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_alertmanager_lookup(
+                call,
+                url.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        Some(SourceConfig::Prometheus {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_prometheus_query(
+                call,
+                url.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        Some(SourceConfig::Github {
+            api_url,
+            repo,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_github_recent_changes(
+                call,
+                api_url.as_deref(),
+                repo.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        Some(SourceConfig::Http {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_http_check(
+                call,
+                url.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        Some(SourceConfig::Dns { fixture_path, .. }) => {
+            execute_dns_lookup(call, fixture_path.as_deref())
+        }
+        Some(SourceConfig::Loki {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_loki_query_range(
+                call,
+                url.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        Some(SourceConfig::Grafana {
+            url,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_grafana_annotations(
+                call,
+                url.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        Some(SourceConfig::Kubernetes {
+            url,
+            namespace,
+            fixture_path,
+            bearer_token_env,
+            ..
+        }) => {
+            execute_kubernetes_events(
+                call,
+                url.as_deref(),
+                namespace.as_deref(),
+                fixture_path.as_deref(),
+                bearer_token_env.as_deref(),
+            )
+            .await
+        }
+        None => Ok((
+            ToolResultStatus::Failed,
+            Vec::new(),
+            Some("source is not registered".to_string()),
+        )),
+    }?;
+    let completed_at = Utc::now().to_rfc3339();
+    Ok(ToolResult {
+        call_id: call.id.clone(),
+        capability_id: call.capability_id.clone(),
+        source_id: call.source_id.clone(),
+        status: result.0,
+        started_at,
+        completed_at,
+        evidence: result.1,
+        error: result.2,
+    })
+}
+
+type AdapterExecution = Result<(ToolResultStatus, Vec<Evidence>, Option<String>), CoreError>;
+
+fn execute_inventory_lookup(call: &ToolCall, path: &Option<PathBuf>) -> AdapterExecution {
+    let Some(path) = path else {
+        return Ok(skipped_result(
+            "inventory-file source has no path configured",
+        ));
+    };
+    if !path.is_file() {
+        return Ok(skipped_result(&format!(
+            "inventory file '{}' does not exist",
+            path.display()
+        )));
+    }
+    let inventory = load_inventory(path)?;
+    let target_selector = call
+        .target
+        .as_deref()
+        .or_else(|| call.inputs.get("target").and_then(Value::as_str));
+    let targets = resolve_targets(None, &inventory, target_selector);
+    let evidence = build_evidence(None, &inventory, &targets, &[])?;
+    Ok((ToolResultStatus::Succeeded, evidence, None))
+}
+
+fn execute_runbook_lookup(
+    call: &ToolCall,
+    dir: Option<&Path>,
+    paths: &[PathBuf],
+) -> AdapterExecution {
+    if dir.is_none() && paths.is_empty() {
+        return Ok(skipped_result(
+            "runbook-file source has neither dir nor paths configured",
+        ));
+    }
+    if let Some(dir) = dir {
+        if !dir.is_dir() {
+            return Ok(skipped_result(&format!(
+                "runbook directory '{}' does not exist",
+                dir.display()
+            )));
+        }
+    }
+    let runbooks = load_runbooks(paths, dir)?;
+    let target = call
+        .target
+        .as_deref()
+        .map(unknown_target)
+        .unwrap_or_else(|| unknown_target("unknown"));
+    let evidence = build_evidence(None, &Inventory::default(), &[target], &runbooks)?;
+    Ok((ToolResultStatus::Succeeded, evidence, None))
+}
+
+async fn execute_alertmanager_lookup(
+    call: &ToolCall,
+    url: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let (alerts, source_path) = if let Some(path) = fixture_path {
+        (load_alerts_fixture(path)?, Some(display_path(path)))
+    } else if let Some(url) = url {
+        match fetch_alertmanager_alerts(url, call, bearer_token_env).await {
+            Ok(value) => (parse_alertmanager_alerts(value)?, None),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "alertmanager source has no url or fixture_path configured",
+        ));
+    };
+    let matcher = call.inputs.get("matcher").and_then(Value::as_str);
+    let filtered = alerts
+        .into_iter()
+        .filter(|alert| alert_matches(alert, matcher, call.target.as_deref()))
+        .collect::<Vec<_>>();
+    let evidence = filtered
+        .iter()
+        .map(|alert| {
+            alert_to_evidence(alert, "alertmanager", source_path.as_deref().map(Path::new))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((ToolResultStatus::Succeeded, evidence, None))
+}
+
+async fn execute_prometheus_query(
+    call: &ToolCall,
+    url: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let query = call
+        .inputs
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("up");
+    let (data, source_path, source_url) = if let Some(path) = fixture_path {
+        (
+            parse_document("prometheus fixture", path)?,
+            Some(display_path(path)),
+            None,
+        )
+    } else if let Some(url) = url {
+        match fetch_prometheus_query_range(url, call, query, bearer_token_env).await {
+            Ok(value) => (value, None, Some(url.to_string())),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "prometheus source has no url or fixture_path configured",
+        ));
+    };
+    let evidence = Evidence {
+        id: format!("metric:{}:{}", call.id, slug_id(query)),
+        kind: EvidenceKind::Metric,
+        summary: format!("Prometheus returned data for query '{query}'."),
+        source: EvidenceSource {
+            kind: "prometheus".to_string(),
+            name: call.source_id.clone(),
+            path: source_path.or(source_url),
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data: json!({
+            "query": query,
+            "since": call.since,
+            "response": data
+        }),
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+async fn execute_github_recent_changes(
+    call: &ToolCall,
+    api_url: Option<&str>,
+    repo: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let repo = call.inputs.get("repo").and_then(Value::as_str).or(repo);
+    let (data, source_path) = if let Some(path) = fixture_path {
+        (
+            parse_document("github fixture", path)?,
+            Some(display_path(path)),
+        )
+    } else if let Some(repo) = repo {
+        match fetch_github_commits(api_url, repo, call, bearer_token_env).await {
+            Ok(value) => (value, None),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "github source has no repo or fixture_path configured",
+        ));
+    };
+    let summary = repo
+        .map(|repo| format!("GitHub supplied recent changes for '{repo}'."))
+        .unwrap_or_else(|| "GitHub supplied recent changes.".to_string());
+    let evidence = Evidence {
+        id: format!("change:{}", call.id),
+        kind: EvidenceKind::Change,
+        summary,
+        source: EvidenceSource {
+            kind: "github".to_string(),
+            name: call.source_id.clone(),
+            path: source_path.or_else(|| repo.map(|repo| format!("github:{repo}"))),
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data: json!({
+            "repo": repo,
+            "since": call.since,
+            "response": data
+        }),
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+async fn execute_http_check(
+    call: &ToolCall,
+    url: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let (data, source_path) = if let Some(path) = fixture_path {
+        (
+            parse_document("http fixture", path)?,
+            Some(display_path(path)),
+        )
+    } else if let Some(url) = call.inputs.get("url").and_then(Value::as_str).or(url) {
+        match fetch_http_check(url, bearer_token_env).await {
+            Ok(value) => (value, Some(url.to_string())),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "http source has no url or fixture_path configured",
+        ));
+    };
+
+    let status = data.get("status").and_then(Value::as_u64);
+    let evidence = Evidence {
+        id: format!("http:{}", call.id),
+        kind: EvidenceKind::External,
+        summary: status
+            .map(|status| format!("HTTP check returned status {status}."))
+            .unwrap_or_else(|| "HTTP check returned data.".to_string()),
+        source: EvidenceSource {
+            kind: "http".to_string(),
+            name: call.source_id.clone(),
+            path: source_path,
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data,
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+fn execute_dns_lookup(call: &ToolCall, fixture_path: Option<&Path>) -> AdapterExecution {
+    let (data, source_path) = if let Some(path) = fixture_path {
+        (
+            parse_document("dns fixture", path)?,
+            Some(display_path(path)),
+        )
+    } else {
+        let Some(host) = call
+            .inputs
+            .get("host")
+            .and_then(Value::as_str)
+            .or(call.target.as_deref())
+            .map(target_name_for_query)
+        else {
+            return Ok(skipped_result("dns lookup has no host or target"));
+        };
+        match resolve_dns_host(&host) {
+            Ok(value) => (value, Some(format!("dns:{host}"))),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    };
+    let evidence = Evidence {
+        id: format!("dns:{}", call.id),
+        kind: EvidenceKind::External,
+        summary: "DNS lookup returned address data.".to_string(),
+        source: EvidenceSource {
+            kind: "dns".to_string(),
+            name: call.source_id.clone(),
+            path: source_path,
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data,
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+async fn execute_loki_query_range(
+    call: &ToolCall,
+    url: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let default_query = call
+        .target
+        .as_deref()
+        .map(default_loki_query)
+        .unwrap_or_else(|| "{}".to_string());
+    let query = call
+        .inputs
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or(default_query.as_str());
+    let (data, source_path) = if let Some(path) = fixture_path {
+        (
+            parse_document("loki fixture", path)?,
+            Some(display_path(path)),
+        )
+    } else if let Some(url) = url {
+        match fetch_loki_query_range(url, call, query, bearer_token_env).await {
+            Ok(value) => (value, Some(url.to_string())),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "loki source has no url or fixture_path configured",
+        ));
+    };
+    let evidence = Evidence {
+        id: format!("log:{}", call.id),
+        kind: EvidenceKind::Log,
+        summary: format!("Loki returned log data for query '{query}'."),
+        source: EvidenceSource {
+            kind: "loki".to_string(),
+            name: call.source_id.clone(),
+            path: source_path,
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data: json!({
+            "query": query,
+            "since": call.since,
+            "response": data
+        }),
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+async fn execute_grafana_annotations(
+    call: &ToolCall,
+    url: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let (data, source_path) = if let Some(path) = fixture_path {
+        (
+            parse_document("grafana fixture", path)?,
+            Some(display_path(path)),
+        )
+    } else if let Some(url) = url {
+        match fetch_grafana_annotations(url, call, bearer_token_env).await {
+            Ok(value) => (value, Some(url.to_string())),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "grafana source has no url or fixture_path configured",
+        ));
+    };
+    let evidence = Evidence {
+        id: format!("grafana:{}", call.id),
+        kind: EvidenceKind::Change,
+        summary: "Grafana returned annotation data for the investigation window.".to_string(),
+        source: EvidenceSource {
+            kind: "grafana".to_string(),
+            name: call.source_id.clone(),
+            path: source_path,
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data,
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+async fn execute_kubernetes_events(
+    call: &ToolCall,
+    url: Option<&str>,
+    namespace: Option<&str>,
+    fixture_path: Option<&Path>,
+    bearer_token_env: Option<&str>,
+) -> AdapterExecution {
+    let namespace = call
+        .inputs
+        .get("namespace")
+        .and_then(Value::as_str)
+        .or(namespace);
+    let (data, source_path) = if let Some(path) = fixture_path {
+        (
+            parse_document("kubernetes fixture", path)?,
+            Some(display_path(path)),
+        )
+    } else if let Some(url) = url {
+        match fetch_kubernetes_events(url, namespace, call, bearer_token_env).await {
+            Ok(value) => (value, Some(url.to_string())),
+            Err(message) => return Ok(failed_result(&message)),
+        }
+    } else {
+        return Ok(skipped_result(
+            "kubernetes source has no url or fixture_path configured",
+        ));
+    };
+    let evidence = Evidence {
+        id: format!("kubernetes:{}", call.id),
+        kind: EvidenceKind::External,
+        summary: "Kubernetes returned event data.".to_string(),
+        source: EvidenceSource {
+            kind: "kubernetes".to_string(),
+            name: call.source_id.clone(),
+            path: source_path,
+        },
+        target: call.target.clone(),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        confidence: 0.8,
+        data,
+        references: Vec::new(),
+    };
+    Ok((ToolResultStatus::Succeeded, vec![evidence], None))
+}
+
+fn skipped_result(message: &str) -> (ToolResultStatus, Vec<Evidence>, Option<String>) {
+    (
+        ToolResultStatus::Skipped,
+        Vec::new(),
+        Some(message.to_string()),
+    )
+}
+
+fn failed_result(message: &str) -> (ToolResultStatus, Vec<Evidence>, Option<String>) {
+    (
+        ToolResultStatus::Failed,
+        Vec::new(),
+        Some(message.to_string()),
+    )
+}
+
+async fn fetch_alertmanager_alerts(
+    base_url: &str,
+    call: &ToolCall,
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let mut query = vec![
+        ("active".to_string(), "true".to_string()),
+        ("silenced".to_string(), "true".to_string()),
+        ("inhibited".to_string(), "true".to_string()),
+    ];
+    if let Some(matcher) = call.inputs.get("matcher").and_then(Value::as_str) {
+        query.push(("filter".to_string(), matcher.to_string()));
+    }
+    http_get_json(
+        &format!("{}/api/v2/alerts", base_url.trim_end_matches('/')),
+        &query,
+        bearer_token_env,
+    )
+    .await
+}
+
+async fn fetch_prometheus_query_range(
+    base_url: &str,
+    call: &ToolCall,
+    query_text: &str,
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let (start, end) = query_window(call.since.as_deref());
+    let step = call
+        .inputs
+        .get("step")
+        .and_then(Value::as_str)
+        .unwrap_or("60s");
+    let query = vec![
+        ("query".to_string(), query_text.to_string()),
+        ("start".to_string(), start.to_rfc3339()),
+        ("end".to_string(), end.to_rfc3339()),
+        ("step".to_string(), step.to_string()),
+    ];
+    http_get_json(
+        &format!("{}/api/v1/query_range", base_url.trim_end_matches('/')),
+        &query,
+        bearer_token_env,
+    )
+    .await
+}
+
+async fn fetch_github_commits(
+    api_url: Option<&str>,
+    repo: &str,
+    call: &ToolCall,
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let (start, _end) = query_window(call.since.as_deref());
+    let base_url = api_url
+        .unwrap_or("https://api.github.com")
+        .trim_end_matches('/');
+    let query = vec![
+        ("since".to_string(), start.to_rfc3339()),
+        ("per_page".to_string(), "20".to_string()),
+    ];
+    let url = format!("{base_url}/repos/{repo}/commits");
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(&url)
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "vigil")
+        .header("x-github-api-version", "2026-03-10")
+        .query(&query);
+    request = apply_bearer_auth(request, bearer_token_env)?;
+    send_json_request(request).await
+}
+
+async fn fetch_http_check(url: &str, bearer_token_env: Option<&str>) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|err| format!("HTTP client could not be built: {err}"))?;
+    let request = apply_bearer_auth(
+        client.get(url).header("user-agent", "vigil"),
+        bearer_token_env,
+    )?;
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("HTTP check failed: {err}"))?;
+    let status = response.status();
+    let final_url = response.url().to_string();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), Value::String(value.to_string())))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("HTTP response body could not be read: {err}"))?;
+    Ok(json!({
+        "url": final_url,
+        "status": status.as_u16(),
+        "success": status.is_success(),
+        "headers": headers,
+        "body_preview": truncate_text(&body, 2048)
+    }))
+}
+
+async fn fetch_loki_query_range(
+    base_url: &str,
+    call: &ToolCall,
+    query_text: &str,
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let query = vec![
+        ("query".to_string(), query_text.to_string()),
+        (
+            "since".to_string(),
+            call.since.clone().unwrap_or_else(|| "30m".to_string()),
+        ),
+        (
+            "limit".to_string(),
+            call.inputs
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .to_string(),
+        ),
+        ("direction".to_string(), "backward".to_string()),
+    ];
+    http_get_json(
+        &format!("{}/loki/api/v1/query_range", base_url.trim_end_matches('/')),
+        &query,
+        bearer_token_env,
+    )
+    .await
+}
+
+async fn fetch_grafana_annotations(
+    base_url: &str,
+    call: &ToolCall,
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let (start, end) = query_window(call.since.as_deref());
+    let mut query = vec![
+        ("from".to_string(), start.timestamp_millis().to_string()),
+        ("to".to_string(), end.timestamp_millis().to_string()),
+    ];
+    if let Some(tags) = call.inputs.get("tags").and_then(Value::as_array) {
+        for tag in tags.iter().filter_map(Value::as_str) {
+            query.push(("tags".to_string(), tag.to_string()));
+        }
+    }
+    http_get_json(
+        &format!("{}/api/annotations", base_url.trim_end_matches('/')),
+        &query,
+        bearer_token_env,
+    )
+    .await
+}
+
+async fn fetch_kubernetes_events(
+    base_url: &str,
+    namespace: Option<&str>,
+    call: &ToolCall,
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let path = namespace
+        .map(|namespace| format!("/apis/events.k8s.io/v1/namespaces/{namespace}/events"))
+        .unwrap_or_else(|| "/apis/events.k8s.io/v1/events".to_string());
+    let mut query = vec![(
+        "limit".to_string(),
+        call.inputs
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(50)
+            .to_string(),
+    )];
+    if let Some(selector) = call.inputs.get("field_selector").and_then(Value::as_str) {
+        query.push(("fieldSelector".to_string(), selector.to_string()));
+    }
+    http_get_json(
+        &format!("{}{}", base_url.trim_end_matches('/'), path),
+        &query,
+        bearer_token_env,
+    )
+    .await
+}
+
+async fn http_get_json(
+    url: &str,
+    query: &[(String, String)],
+    bearer_token_env: Option<&str>,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let request = client.get(url).header("user-agent", "vigil").query(query);
+    let request = apply_bearer_auth(request, bearer_token_env)?;
+    send_json_request(request).await
+}
+
+fn apply_bearer_auth(
+    request: reqwest::RequestBuilder,
+    bearer_token_env: Option<&str>,
+) -> Result<reqwest::RequestBuilder, String> {
+    match bearer_token_env {
+        Some(env_name) => {
+            let token = env::var(env_name)
+                .map_err(|_| format!("bearer token env var '{env_name}' is not set"))?;
+            Ok(request.bearer_auth(token))
+        }
+        None => Ok(request),
+    }
+}
+
+async fn send_json_request(request: reqwest::RequestBuilder) -> Result<Value, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("read-only HTTP request failed: {err}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("read-only HTTP response body could not be read: {err}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "read-only HTTP request returned HTTP {}: {}",
+            status.as_u16(),
+            truncate_text(&body, 500)
+        ));
+    }
+    serde_json::from_str(&body)
+        .map_err(|err| format!("read-only HTTP response was not JSON: {err}"))
+}
+
+fn query_window(since: Option<&str>) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+    let end = Utc::now();
+    let duration = since
+        .and_then(parse_duration)
+        .unwrap_or_else(|| ChronoDuration::minutes(30));
+    (end - duration, end)
+}
+
+fn parse_duration(value: &str) -> Option<ChronoDuration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (number, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
+    let amount = number.parse::<i64>().ok()?;
+    match unit {
+        "s" => Some(ChronoDuration::seconds(amount)),
+        "m" => Some(ChronoDuration::minutes(amount)),
+        "h" => Some(ChronoDuration::hours(amount)),
+        "d" => Some(ChronoDuration::days(amount)),
+        _ => None,
+    }
+}
+
+fn resolve_dns_host(host: &str) -> Result<Value, String> {
+    let addresses = (host, 0)
+        .to_socket_addrs()
+        .map_err(|err| format!("DNS lookup for '{host}' failed: {err}"))?
+        .map(|address| Value::String(address.ip().to_string()))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "host": host,
+        "addresses": addresses
+    }))
+}
+
+fn truncate_text(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        value.to_string()
+    } else {
+        format!("{}...", &value[..limit])
+    }
+}
+
+fn parse_alertmanager_alerts(value: Value) -> Result<Vec<Alert>, CoreError> {
+    let alerts_value = value
+        .get("alerts")
+        .or_else(|| value.get("data"))
+        .cloned()
+        .unwrap_or(value);
+    let Some(alerts) = alerts_value.as_array() else {
+        return Err(CoreError::Validation {
+            kind: "alertmanager response",
+            path: "live".to_string(),
+            errors: "expected an array of alerts".to_string(),
+        });
+    };
+
+    let parsed = alerts
+        .iter()
+        .enumerate()
+        .map(|(index, alert)| alertmanager_value_to_alert(index, alert))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_alerts_fixture(&parsed, Path::new("live"))?;
+    Ok(parsed)
+}
+
+fn alertmanager_value_to_alert(index: usize, value: &Value) -> Result<Alert, CoreError> {
+    let labels = string_map(value.get("labels"));
+    let annotations = value
+        .get("annotations")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let name = labels
+        .get("alertname")
+        .cloned()
+        .unwrap_or_else(|| format!("alert-{index}"));
+    let summary = annotations
+        .get("summary")
+        .and_then(Value::as_str)
+        .or_else(|| annotations.get("description").and_then(Value::as_str))
+        .unwrap_or(&name)
+        .to_string();
+    let severity = labels
+        .get("severity")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = value
+        .pointer("/status/state")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("status").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    let target = labels
+        .get("target")
+        .or_else(|| labels.get("service"))
+        .map(|value| {
+            if value.contains(':') {
+                value.clone()
+            } else {
+                format!("service:{value}")
+            }
+        });
+
+    Ok(Alert {
+        id: value
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{}-{index}", slug_id(&name))),
+        name,
+        severity,
+        status,
+        summary,
+        description: annotations
+            .get("description")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        target,
+        started_at: value
+            .get("startsAt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        ended_at: value
+            .get("endsAt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        labels,
+        annotations,
+        source: Some("alertmanager".to_string()),
+    })
+}
+
+fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn load_alerts_fixture(path: &Path) -> Result<Vec<Alert>, CoreError> {
+    let value: Value = parse_document("alertmanager fixture", path)?;
+    let alerts_value = value
+        .get("alerts")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    if alerts_value.is_array() {
+        let alerts: Vec<Alert> =
+            serde_json::from_value(alerts_value).map_err(|source| CoreError::ParseJson {
+                kind: "alertmanager fixture",
+                path: path.display().to_string(),
+                source,
+            })?;
+        validate_alerts_fixture(&alerts, path)?;
+        Ok(alerts)
+    } else {
+        let alert: Alert =
+            serde_json::from_value(alerts_value).map_err(|source| CoreError::ParseJson {
+                kind: "alertmanager fixture",
+                path: path.display().to_string(),
+                source,
+            })?;
+        validate_alerts_fixture(std::slice::from_ref(&alert), path)?;
+        Ok(vec![alert])
+    }
+}
+
+fn validate_alerts_fixture(alerts: &[Alert], path: &Path) -> Result<(), CoreError> {
+    let errors = alerts.iter().flat_map(Alert::validate).collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CoreError::Validation {
+            kind: "alertmanager fixture",
+            path: display_path(path),
+            errors: errors.join("; "),
+        })
+    }
+}
+
+fn alert_matches(alert: &Alert, matcher: Option<&str>, target: Option<&str>) -> bool {
+    let matcher_matches = matcher.is_some_and(|matcher| {
+        let matcher = matcher.trim();
+        if let Some((key, value)) = matcher.split_once('=') {
+            (key == "alertname" && alert.name == value)
+                || alert.labels.get(key).is_some_and(|label| label == value)
+        } else {
+            alert.name == matcher
+                || alert.id == matcher
+                || alert.target.as_deref() == Some(matcher)
+                || alert.labels.values().any(|value| value == matcher)
+        }
+    });
+    let target_matches = target.is_some_and(|target| alert.target.as_deref() == Some(target));
+    if matcher.is_none() && target.is_none() {
+        true
+    } else {
+        matcher_matches || target_matches
+    }
+}
+
+fn alert_to_evidence(
+    alert: &Alert,
+    source_name: &str,
+    path: Option<&Path>,
+) -> Result<Evidence, CoreError> {
+    Ok(Evidence {
+        id: format!("alertmanager:{}", alert.id),
+        kind: EvidenceKind::Alert,
+        summary: alert.summary.clone(),
+        source: EvidenceSource {
+            kind: "alertmanager".to_string(),
+            name: source_name.to_string(),
+            path: path.map(display_path),
+        },
+        target: alert.target.clone(),
+        timestamp: alert.started_at.clone(),
+        confidence: 0.9,
+        data: serde_json::to_value(alert).map_err(|err| CoreError::Redaction(err.to_string()))?,
+        references: Vec::new(),
+    })
+}
+
+fn tool_call_dedupe_key(call: &ToolCall) -> String {
+    let inputs = serde_json::to_string(&call.inputs).unwrap_or_default();
+    format!(
+        "{}|{}|{}|{}",
+        call.capability_id,
+        call.source_id,
+        call.target.as_deref().unwrap_or_default(),
+        inputs
+    )
 }
 
 pub fn load_alert(path: &Path) -> Result<Alert, CoreError> {
@@ -1561,7 +3765,13 @@ fn display_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     use async_trait::async_trait;
     use tempfile::TempDir;
@@ -1569,6 +3779,9 @@ mod tests {
     use super::*;
 
     struct MockProvider;
+
+    type AgentFixturePaths = (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf);
+    type RequestLogHandle = thread::JoinHandle<Vec<String>>;
 
     #[async_trait]
     impl LlmProvider for MockProvider {
@@ -1795,6 +4008,453 @@ checks:
                 .map(|metadata| metadata.provider.as_str()),
             Some("mock")
         );
+        Ok(())
+    }
+
+    fn write_agent_fixtures(dir: &Path) -> Result<AgentFixturePaths, Box<dyn std::error::Error>> {
+        let (inventory_path, _alert_path, runbook_path) = write_example_inputs(dir)?;
+        let alertmanager_path = dir.join("alertmanager.yaml");
+        let prometheus_path = dir.join("prometheus.yaml");
+        let github_path = dir.join("github.yaml");
+
+        fs::write(
+            &alertmanager_path,
+            r#"
+alerts:
+  - id: web-5xx-live
+    name: WebHigh5xx
+    severity: page
+    status: firing
+    summary: Web 5xx responses are still firing in Alertmanager.
+    target: service:web
+    started_at: "2026-06-29T00:10:00Z"
+    labels:
+      service: web
+"#,
+        )?;
+        fs::write(
+            &prometheus_path,
+            r#"
+status: success
+data:
+  resultType: vector
+  result:
+    - metric:
+        service: web
+      value:
+        - 1780000000
+        - "8.4"
+"#,
+        )?;
+        fs::write(
+            &github_path,
+            r#"
+changes:
+  - title: Adjust upstream timeout
+    url: https://github.com/example/web/pull/123
+    merged_at: "2026-06-29T00:00:00Z"
+"#,
+        )?;
+
+        Ok((
+            inventory_path,
+            runbook_path,
+            alertmanager_path,
+            prometheus_path,
+            github_path,
+        ))
+    }
+
+    fn agent_sources(
+        inventory_path: PathBuf,
+        runbook_path: PathBuf,
+        alertmanager_path: PathBuf,
+        prometheus_path: PathBuf,
+        github_path: PathBuf,
+    ) -> Vec<SourceConfig> {
+        vec![
+            SourceConfig::InventoryFile {
+                name: "local".to_string(),
+                path: Some(inventory_path),
+            },
+            SourceConfig::RunbookFile {
+                name: "local".to_string(),
+                dir: None,
+                paths: vec![runbook_path],
+            },
+            SourceConfig::Alertmanager {
+                name: "prod".to_string(),
+                url: None,
+                fixture_path: Some(alertmanager_path),
+                bearer_token_env: None,
+            },
+            SourceConfig::Prometheus {
+                name: "prod".to_string(),
+                url: None,
+                fixture_path: Some(prometheus_path),
+                bearer_token_env: None,
+            },
+            SourceConfig::Github {
+                name: "main".to_string(),
+                api_url: None,
+                repo: Some("example/web".to_string()),
+                fixture_path: Some(github_path),
+                bearer_token_env: None,
+            },
+        ]
+    }
+
+    fn start_json_server(
+        body: String,
+        expected_requests: usize,
+    ) -> Result<(String, RequestLogHandle), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..expected_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0; 16_384];
+                let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buffer[..bytes_read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            requests
+        });
+        Ok((format!("http://{address}"), handle))
+    }
+
+    #[tokio::test]
+    async fn plan_only_agent_investigation_lists_read_only_calls(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (inventory_path, runbook_path, alertmanager_path, prometheus_path, github_path) =
+            write_agent_fixtures(temp.path())?;
+
+        let outcome = plan_agent_investigation(
+            AgentInvestigationRequest {
+                selector: InvestigationSelector::Target("service:web".to_string()),
+                since: Some("30m".to_string()),
+                sources: agent_sources(
+                    inventory_path,
+                    runbook_path,
+                    alertmanager_path,
+                    prometheus_path,
+                    github_path,
+                ),
+                source_filters: Vec::new(),
+                budget: InvestigationBudget {
+                    max_iterations: 1,
+                    max_tool_calls: 8,
+                    max_duration_secs: 60,
+                },
+                no_llm: true,
+                dry_run: false,
+                plan_only: true,
+            },
+            None,
+        )
+        .await?;
+
+        let capability_ids = outcome
+            .plan
+            .calls
+            .iter()
+            .map(|call| call.capability_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(capability_ids.contains("inventory_lookup"));
+        assert!(capability_ids.contains("runbook_lookup"));
+        assert!(capability_ids.contains("alertmanager_active_alerts"));
+        assert!(capability_ids.contains("prometheus_query"));
+        assert!(capability_ids.contains("github_recent_changes"));
+        assert!(outcome
+            .capabilities
+            .iter()
+            .all(|capability| capability.read_only));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_investigation_collects_fixture_evidence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (inventory_path, runbook_path, alertmanager_path, prometheus_path, github_path) =
+            write_agent_fixtures(temp.path())?;
+
+        let outcome = investigate_agent(
+            AgentInvestigationRequest {
+                selector: InvestigationSelector::Target("service:web".to_string()),
+                since: Some("30m".to_string()),
+                sources: agent_sources(
+                    inventory_path,
+                    runbook_path,
+                    alertmanager_path,
+                    prometheus_path,
+                    github_path,
+                ),
+                source_filters: Vec::new(),
+                budget: InvestigationBudget {
+                    max_iterations: 1,
+                    max_tool_calls: 8,
+                    max_duration_secs: 60,
+                },
+                no_llm: true,
+                dry_run: false,
+                plan_only: false,
+            },
+            None,
+        )
+        .await?;
+
+        let loop_record = outcome
+            .trajectory
+            .investigation_loop
+            .as_ref()
+            .ok_or("missing investigation loop")?;
+        assert_eq!(loop_record.iterations.len(), 1);
+        assert!(loop_record.iterations[0]
+            .results
+            .iter()
+            .any(|result| result.status == ToolResultStatus::Succeeded));
+        assert!(outcome
+            .trajectory
+            .evidence_packet
+            .evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::Metric));
+        assert!(outcome
+            .trajectory
+            .evidence_packet
+            .evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::Change));
+        assert!(outcome
+            .trajectory
+            .evidence_packet
+            .evidence
+            .iter()
+            .any(|item| item.source.kind == "alertmanager"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_investigation_collects_live_required_adapter_evidence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alertmanager_body = serde_json::to_string(&json!([{
+            "fingerprint": "alert-fingerprint",
+            "labels": {
+                "alertname": "WebHigh5xxRate",
+                "service": "web",
+                "severity": "page"
+            },
+            "annotations": {
+                "summary": "Web 5xx responses are firing."
+            },
+            "startsAt": "2026-06-29T00:10:00Z",
+            "status": {
+                "state": "active"
+            }
+        }]))?;
+        let prometheus_body = serde_json::to_string(&json!({
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": []
+            }
+        }))?;
+        let github_body = serde_json::to_string(&json!([{
+            "sha": "abc123",
+            "html_url": "https://github.com/example/web/commit/abc123",
+            "commit": {
+                "message": "Adjust web timeout",
+                "author": {
+                    "date": "2026-06-29T00:00:00Z"
+                }
+            }
+        }]))?;
+        let (alertmanager_url, alertmanager_handle) = start_json_server(alertmanager_body, 1)?;
+        let (prometheus_url, prometheus_handle) = start_json_server(prometheus_body, 2)?;
+        let (github_url, github_handle) = start_json_server(github_body, 1)?;
+
+        let outcome = investigate_agent(
+            AgentInvestigationRequest {
+                selector: InvestigationSelector::Target("service:web".to_string()),
+                since: Some("30m".to_string()),
+                sources: vec![
+                    SourceConfig::Alertmanager {
+                        name: "prod".to_string(),
+                        url: Some(alertmanager_url),
+                        fixture_path: None,
+                        bearer_token_env: None,
+                    },
+                    SourceConfig::Prometheus {
+                        name: "prod".to_string(),
+                        url: Some(prometheus_url),
+                        fixture_path: None,
+                        bearer_token_env: None,
+                    },
+                    SourceConfig::Github {
+                        name: "main".to_string(),
+                        api_url: Some(github_url),
+                        repo: Some("example/web".to_string()),
+                        fixture_path: None,
+                        bearer_token_env: None,
+                    },
+                ],
+                source_filters: Vec::new(),
+                budget: InvestigationBudget {
+                    max_iterations: 1,
+                    max_tool_calls: 8,
+                    max_duration_secs: 60,
+                },
+                no_llm: true,
+                dry_run: false,
+                plan_only: false,
+            },
+            None,
+        )
+        .await?;
+
+        let evidence = &outcome.trajectory.evidence_packet.evidence;
+        assert!(evidence
+            .iter()
+            .any(|item| item.source.kind == "alertmanager"));
+        assert!(evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::Metric));
+        assert!(evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::Change));
+        let alertmanager_requests = alertmanager_handle
+            .join()
+            .map_err(|_| "alertmanager server thread panicked")?;
+        let prometheus_requests = prometheus_handle
+            .join()
+            .map_err(|_| "prometheus server thread panicked")?;
+        let github_requests = github_handle
+            .join()
+            .map_err(|_| "github server thread panicked")?;
+        assert_eq!(alertmanager_requests.len(), 1);
+        assert_eq!(prometheus_requests.len(), 2);
+        assert_eq!(github_requests.len(), 1);
+        assert!(github_requests[0].contains("/repos/example/web/commits"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_investigation_collects_optional_adapter_evidence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let dns_path = temp.path().join("dns.yaml");
+        let loki_path = temp.path().join("loki.yaml");
+        let grafana_path = temp.path().join("grafana.yaml");
+        let kubernetes_path = temp.path().join("kubernetes.yaml");
+        fs::write(
+            &dns_path,
+            r#"
+host: web.example.com
+addresses:
+  - 203.0.113.10
+"#,
+        )?;
+        fs::write(
+            &loki_path,
+            r#"
+status: success
+data:
+  result:
+    - stream:
+        service: web
+      values: []
+"#,
+        )?;
+        fs::write(
+            &grafana_path,
+            r#"
+- id: 1
+  text: deploy web
+  tags:
+    - web
+"#,
+        )?;
+        fs::write(
+            &kubernetes_path,
+            r#"
+items:
+  - metadata:
+      name: web-event
+    reason: Pulled
+"#,
+        )?;
+        let http_body = serde_json::to_string(&json!({"ok": true}))?;
+        let (http_url, http_handle) = start_json_server(http_body, 1)?;
+
+        let outcome = investigate_agent(
+            AgentInvestigationRequest {
+                selector: InvestigationSelector::Target("service:web".to_string()),
+                since: Some("30m".to_string()),
+                sources: vec![
+                    SourceConfig::Http {
+                        name: "web".to_string(),
+                        url: Some(http_url),
+                        fixture_path: None,
+                        bearer_token_env: None,
+                    },
+                    SourceConfig::Dns {
+                        name: "web".to_string(),
+                        fixture_path: Some(dns_path),
+                    },
+                    SourceConfig::Loki {
+                        name: "prod".to_string(),
+                        url: None,
+                        fixture_path: Some(loki_path),
+                        bearer_token_env: None,
+                    },
+                    SourceConfig::Grafana {
+                        name: "prod".to_string(),
+                        url: None,
+                        fixture_path: Some(grafana_path),
+                        bearer_token_env: None,
+                    },
+                    SourceConfig::Kubernetes {
+                        name: "prod".to_string(),
+                        url: None,
+                        namespace: Some("default".to_string()),
+                        fixture_path: Some(kubernetes_path),
+                        bearer_token_env: None,
+                    },
+                ],
+                source_filters: Vec::new(),
+                budget: InvestigationBudget {
+                    max_iterations: 1,
+                    max_tool_calls: 8,
+                    max_duration_secs: 60,
+                },
+                no_llm: true,
+                dry_run: false,
+                plan_only: false,
+            },
+            None,
+        )
+        .await?;
+
+        let evidence = &outcome.trajectory.evidence_packet.evidence;
+        assert!(evidence.iter().any(|item| item.source.kind == "http"));
+        assert!(evidence.iter().any(|item| item.source.kind == "dns"));
+        assert!(evidence.iter().any(|item| item.source.kind == "loki"));
+        assert!(evidence.iter().any(|item| item.source.kind == "grafana"));
+        assert!(evidence.iter().any(|item| item.source.kind == "kubernetes"));
+        let http_requests = http_handle
+            .join()
+            .map_err(|_| "http server thread panicked")?;
+        assert_eq!(http_requests.len(), 1);
         Ok(())
     }
 
