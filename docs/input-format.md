@@ -89,3 +89,9 @@ checks:
 ```
 
 Runbook checks must be read-only. Vigil recommends them; it does not execute them.
+
+## Source Fixtures
+
+Target and alert investigation can read fixture files configured in `vigil.toml`.
+
+Alertmanager fixtures may contain either one alert object or an `alerts` array using the alert shape above. Prometheus, GitHub, HTTP, DNS, Loki, Grafana, and Kubernetes fixtures are parsed as YAML or JSON and stored as adapter evidence without schema-specific interpretation.

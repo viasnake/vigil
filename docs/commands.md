@@ -65,7 +65,33 @@ vigil runbook add web-5xx examples/minimal/runbooks/web-5xx.yaml
 
 ## `vigil investigate`
 
-Investigates a case:
+Investigates a target with the read-only agent flow:
+
+```bash
+vigil investigate service:web --since 30m
+```
+
+Investigates an alert:
+
+```bash
+vigil investigate alert WebHigh5xxRate --since 30m
+```
+
+Shows the proposed read-only collection plan without executing adapters or sending an LLM request:
+
+```bash
+vigil investigate service:web --since 30m --plan-only
+```
+
+By default, target and alert investigation write:
+
+```text
+output/brief.md
+output/brief.json
+output/trajectory.json
+```
+
+Case workspaces remain supported:
 
 ```bash
 vigil investigate web-5xx
@@ -105,6 +131,12 @@ Shared options:
 --retry-count <COUNT>
 --dry-run
 --no-llm
+--since <DURATION>
+--plan-only
+--source <SOURCE>
+--max-iterations <COUNT>
+--max-tool-calls <COUNT>
+--max-duration-secs <SECONDS>
 ```
 
 File-mode options:
@@ -119,9 +151,24 @@ TARGET
 
 If the positional argument is a case directory, do not combine it with file-mode flags.
 
-`--no-llm` produces deterministic output for tests and local verification. `--dry-run` also avoids an LLM request.
+`--no-llm` produces deterministic output for tests and local verification. `--dry-run` also avoids an LLM request. `--plan-only` is available only for target and alert investigation.
 
 `--endpoint` accepts `rest` or `gateway`. `rest` is the default Cloudflare REST API path. `gateway` uses the documented `gateway.ai.cloudflare.com` provider-native path.
+
+Current target and alert investigation adapters:
+
+```text
+inventory-file    reads a configured local inventory file
+runbook-file      reads configured local runbook files/directories
+alertmanager      reads active alerts from /api/v2/alerts or a fixture file
+prometheus        reads range query data from /api/v1/query_range or a fixture file
+github            reads recent commits from the GitHub commits API or a fixture file
+http              reads configured endpoint status and response metadata
+dns               resolves target host addresses or reads a fixture file
+loki              reads query_range log data or a fixture file
+grafana           reads annotations or a fixture file
+kubernetes        reads events from a configured Kubernetes API URL or a fixture file
+```
 
 ## `vigil config check`
 

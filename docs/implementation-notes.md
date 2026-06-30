@@ -7,7 +7,8 @@ Concise implementation knowledge discovered while building Vigil.
 * Rust workspace is implemented with the requested crate split: CLI, config, core workflow, LLM provider, shared models, and rendering.
 * `docs/goal.md` is the single goal contract; the previous root-level `goal.md` duplicate was moved there.
 * Minimal examples exist under `examples/minimal/` and still work with deterministic `--no-llm` file-based investigation.
-* Case-based investigation is now implemented as the primary UX: `case init`, `evidence add`, `change add`, `runbook add`, and `investigate <case-dir>`.
+* Target- and alert-based investigation are now implemented as the primary UX: `investigate service:web --since 30m`, `investigate alert WebHigh5xxRate --since 30m`, and `--plan-only`.
+* Case-based investigation remains implemented: `case init`, `evidence add`, `change add`, `runbook add`, and `investigate <case-dir>`.
 * Required user-facing docs are present.
 * CI workflow now exists at `.github/workflows/ci.yml`; before this readiness pass, implementation notes overstated CI readiness.
 
@@ -19,14 +20,27 @@ Concise implementation knowledge discovered while building Vigil.
 * The core workflow builds a redacted `EvidencePacket` before any LLM call. Redaction masks common secret-like field names, token-like values, and common inline secret assignments such as `api_token=...`, but remains best-effort.
 * The LLM prompt was simplified after live testing with smaller Workers AI models; the provider also normalizes common small-model shape drift before applying the same schema and semantic validation.
 * Tests avoid real Cloudflare credentials by using deterministic `--no-llm` mode and a mock provider.
-* CLI smoke tests cover `vigil version`, `vigil validate` with `examples/minimal`, `vigil investigate` with `examples/minimal --no-llm`, and rendering from a saved trajectory.
+* CLI smoke tests cover `vigil version`, `vigil validate` with `examples/minimal`, target/alert `--plan-only`, target `--no-llm` output, file-based `examples/minimal --no-llm`, and rendering from a saved trajectory.
+* Core tests cover live local-HTTP collection for required Alertmanager, Prometheus, and GitHub adapters plus optional HTTP, DNS, Loki, Grafana, and Kubernetes adapter evidence collection.
 * Markdown rendering has a golden-style fixture at `crates/vigil-render/tests/fixtures/evidence_brief.md`.
 * Case evidence intake writes existing `Evidence` model YAML under `<case>/evidence/`; change intake uses `kind: change`.
 * Case investigation reads `<case>/vigil.yaml`, `<case>/evidence/`, and `<case>/runbooks/`, then writes default outputs under `<case>/output/`.
 * `vigil investigate <case-dir>` rejects case directories combined with file-mode flags such as `--inventory`.
+* Agent investigation registers `Source`, `Capability`, `ToolPlan`, `ToolResult`, `InvestigationLoop`, and `InvestigationBudget` models in trajectory output.
+* Agent investigation supports read-only source configs for `inventory-file`, `runbook-file`, `alertmanager`, `prometheus`, `github`, `http`, `dns`, `loki`, `grafana`, and `kubernetes`.
+* `inventory-file` and `runbook-file` adapters read local files. External adapters support configured read-only network calls and fixture-backed local collection.
+* LLM planning now requests and validates a dedicated `ToolPlan` schema instead of deriving plans only from `ReasoningResult.recommended_checks`.
+* `--plan-only` prints a policy-validated read-only collection plan without executing adapters or sending an LLM request.
+* Agent investigations write `output/brief.md`, `output/brief.json`, and `output/trajectory.json` by default when explicit output paths are not supplied.
 
 ## Validation Notes
 
+* During the read-only agent implementation, `cargo fmt` passed.
+* During the read-only agent implementation, `cargo check --workspace` passed.
+* During the read-only agent implementation, `cargo fmt --check` passed.
+* During the read-only agent implementation, `cargo clippy --workspace --all-targets -- -D warnings` passed.
+* During the read-only agent implementation, `cargo test --workspace` initially failed in existing `vigil-llm` localhost HTTP tests with sandbox `Operation not permitted`, then passed when rerun with the required permission.
+* After completing live adapters and ToolPlan planning, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed.
 * `cargo fmt --check` passed after the live product-evaluation fixes.
 * `cargo clippy --workspace --all-targets -- -D warnings` passed after the live product-evaluation fixes.
 * `cargo test --workspace` passed after the live product-evaluation fixes.
@@ -46,7 +60,8 @@ Concise implementation knowledge discovered while building Vigil.
 
 * Redaction is intentionally basic and cannot guarantee perfect secret detection.
 * Prompt-injection text inside supplied evidence remains visible as evidence content after secret redaction; validation prevents generated recommended checks from becoming shell commands, but raw evidence should still be reviewed before sharing output.
-* File inputs cover alert, inventory, and runbook evidence; there are no log, metric, change, ticketing, or monitoring adapters.
+* CloudWatch, ticketing, and tracing adapters are not implemented.
+* Kubernetes support is direct read-only API access from a configured URL; Vigil does not require Kubernetes and does not run a target-host agent.
 
 ## Open Questions
 

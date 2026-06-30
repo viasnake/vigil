@@ -37,7 +37,14 @@ cf-aig-authorization: Bearer <CLOUDFLARE_API_TOKEN>
 Content-Type: application/json
 ```
 
-Vigil asks the model to return only a JSON `ReasoningResult`. The response is parsed from `choices[0].message.content`, schema-validated, and semantically checked before rendering. Invalid model responses fail the investigation instead of being treated as authoritative output.
+Vigil uses Cloudflare AI Gateway for two JSON contracts:
+
+```text
+ToolPlan          proposed read-only collection steps
+ReasoningResult   final evidence-backed reasoning
+```
+
+Both responses are parsed from `choices[0].message.content`, schema-validated, and semantically checked before use. `ToolPlan` calls are then validated against the local read-only capability registry before any adapter runs. Invalid model responses fail the investigation instead of being treated as authoritative output.
 
 References:
 

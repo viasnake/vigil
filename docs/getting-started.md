@@ -6,7 +6,34 @@ Build and run the CLI from the workspace:
 cargo run -p vigil-cli -- version
 ```
 
-Create a local investigation case:
+Inspect a read-only investigation plan:
+
+```bash
+cargo run -p vigil-cli -- investigate service:web \
+  --since 30m \
+  --plan-only \
+  --no-llm
+```
+
+Run a deterministic target investigation without Cloudflare credentials:
+
+```bash
+cargo run -p vigil-cli -- investigate service:web \
+  --since 30m \
+  --no-llm
+```
+
+This writes:
+
+```text
+output/brief.md
+output/brief.json
+output/trajectory.json
+```
+
+Without a source config, built-in default source skeletons are registered but most collection steps are skipped. Add source config in `vigil.toml` to read local inventory/runbook files and configured read-only sources such as Alertmanager, Prometheus, GitHub, HTTP, DNS, Loki, Grafana, or Kubernetes.
+
+Create a local investigation case when you want to curate evidence manually:
 
 ```bash
 cargo run -p vigil-cli -- case init /tmp/web-5xx \

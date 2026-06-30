@@ -2,7 +2,7 @@
 
 ## Project
 
-Vigil is an open-source, AI-assisted SRE investigation tool.
+Vigil is an open-source, read-only SRE investigation agent.
 
 Repository:
 
@@ -10,9 +10,9 @@ Repository:
 github.com/viasnake/vigil
 ```
 
-Vigil helps operators convert alerts, incidents, and operational questions into structured, evidence-backed investigation briefs.
+Vigil helps operators start from a target, alert, incident, or operational question; collect bounded read-only context from configured sources; and produce structured, evidence-backed investigation briefs.
 
-Vigil is not a general-purpose AI agent, a coding agent, a ChatOps bot, or an autonomous remediation system. It is focused on the first and most important phase of SRE work: understanding what is happening, what evidence exists, what may have changed, and what should be checked next.
+Vigil is an agent only in the investigation sense. It is not a general-purpose AI agent, a coding agent, a ChatOps bot, or an autonomous remediation system. It is focused on the first and most important phase of SRE work: understanding what is happening, what evidence exists, what may have changed, and what should be checked next.
 
 ## Background and Rationale
 
@@ -55,7 +55,7 @@ Vigil starts with assisted investigation because this is the safest and most gen
 
 Investigation work benefits from LLMs because it involves summarizing partial evidence, connecting symptoms with known failure modes, and proposing next checks. However, execution and remediation require stronger safety controls, validation, authorization, and rollback semantics.
 
-Vigil 1.0 does not implement execution.
+Vigil 1.0 does not implement production execution or remediation. It may execute bounded, policy-validated, read-only collection through registered capabilities.
 
 This keeps the initial product useful without creating unnecessary production risk.
 
@@ -95,15 +95,17 @@ Rust is suitable for this project because Vigil should:
 Vigil should avoid heavy agent frameworks in 1.0.
 
 The core value is not an agent framework.
-The core value is the structured pipeline:
+The core value is the bounded read-only investigation pipeline:
 
 ```text
-EvidencePacket
-  -> Cloudflare AI Gateway
-  -> ReasoningResult
-  -> validation
+target or alert
+  -> read-only context collection
+  -> LLM-assisted investigation planning
+  -> policy-validated read-only tool calls
+  -> evidence collection
+  -> hypothesis update
   -> EvidenceBrief
-  -> Trajectory
+  -> trajectory record
 ```
 
 ### Why Trajectory Recording
@@ -116,6 +118,10 @@ The trajectory is not a transcript. It is a structured record of:
 
 * inputs,
 * resolved targets,
+* configured sources,
+* registered capabilities,
+* planned read-only tool calls,
+* tool results,
 * evidence,
 * LLM request metadata,
 * LLM response metadata,
@@ -134,6 +140,7 @@ This supports future evaluation without requiring Vigil 1.0 to implement a full 
 | Focus on assisted investigation               | AI can reduce initial investigation load without requiring unsafe production mutation.              |
 | Produce Evidence Briefs                       | Operators need a compact, source-backed view before acting.                                         |
 | Do not execute production actions             | Reasoning and actuation must remain separate until safety controls exist.                           |
+| Execute only registered read-only collection  | Vigil needs operational context without becoming a remediation or shell execution system.           |
 | Use Cloudflare AI Gateway only in 1.0         | Keeps provider integration small while allowing centralized AI gateway behavior.                    |
 | Avoid ChatGPT/Codex subscription reuse        | Subscription sign-in is not a general-purpose API provider contract for Vigil.                      |
 | Use Rust                                      | Supports lightweight, reliable, distributable CLI implementation.                                   |
@@ -205,48 +212,90 @@ User-facing docs must describe the actual implementation.
 
 ## 1.0 Goal
 
-Vigil 1.0 must be a reliable Rust CLI that can investigate an operational issue using structured inputs, read-only integrations, and Cloudflare AI Gateway.
+Vigil 1.0 must be a reliable Rust CLI that can start from a target, alert, or incident case; collect bounded read-only operational context from configured sources; iteratively update hypotheses; and produce an evidence-backed investigation brief through Cloudflare AI Gateway or deterministic no-LLM mode.
 
-At 1.0, a user should be able to run a case-based investigation:
+The primary 1.0 workflow is:
 
-```bash
-vigil case init web-5xx \
-  --target service:web \
-  --severity page \
-  --summary "Web service 5xx responses are above threshold"
-
-vigil evidence add web-5xx \
-  --kind metric \
-  --summary "HTTP 5xx rate increased from 0.2% to 8.4%" \
-  --source prometheus \
-  --url "https://grafana.example.com/d/web"
-
-vigil change add web-5xx \
-  --summary "Caddy upstream timeout setting changed before the alert" \
-  --source github \
-  --url "https://github.com/example/repo/pull/123"
-
-vigil runbook add web-5xx examples/minimal/runbooks/web-5xx.yaml
-
-vigil investigate web-5xx
+```text
+target or alert
+  -> read-only context collection
+  -> LLM-assisted investigation planning
+  -> policy-validated read-only tool calls
+  -> evidence collection
+  -> hypothesis update
+  -> evidence-backed brief
+  -> trajectory record
 ```
 
-and receive a useful investigation brief containing:
+The primary user commands are:
 
-* affected target summary,
-* relevant evidence,
-* recent changes,
-* LLM-assisted hypotheses,
-* missing checks,
-* recommended read-only checks,
-* uncertainty,
-* source references,
-* structured JSON output,
-* and a trajectory record suitable for later review.
+```bash
+vigil investigate service:web --since 30m
+vigil investigate alert WebHigh5xxRate --since 30m
+vigil investigate service:web --since 30m --plan-only
+```
 
-The existing file-based workflow remains supported for scripting and tests.
+File-based and case-based investigation remain supported for scripting, tests, and manually curated evidence, but they are not the primary user experience.
 
-Vigil 1.0 must be useful for a real SRE investigation without executing production actions.
+Vigil 1.0 must support:
+
+* case-based investigation,
+* target-based investigation,
+* alert-based investigation,
+* configured read-only sources,
+* a bounded investigation loop,
+* LLM-assisted next-check planning,
+* policy validation before every tool call,
+* evidence collection from read-only adapters,
+* evidence-backed brief generation,
+* trajectory recording.
+
+Required 1.0 source and capability concepts:
+
+* `Source`: a configured read-only context source.
+* `Capability`: a registered read-only operation available through a source.
+* `ToolPlan`: proposed read-only collection steps.
+* `ToolResult`: evidence and status from a read-only adapter.
+* `InvestigationLoop`: bounded plan, validate, collect, update iterations.
+* `InvestigationBudget`: `max_iterations`, `max_tool_calls`, and `max_duration_secs`.
+
+Required 1.0 read-only adapters:
+
+* `inventory-file`
+* `runbook-file`
+* `alertmanager`
+* `prometheus`
+* `github`
+* `http`
+* `dns`
+* `loki`
+* `grafana`
+* `kubernetes`
+
+External adapters may support fixtures for tests and local replay, but their interfaces must be real read-only adapter interfaces rather than ad hoc evidence fields.
+
+Vigil may:
+
+* choose read-only investigation steps,
+* collect evidence from configured sources,
+* update hypotheses,
+* identify missing checks,
+* produce briefs.
+
+Vigil must not:
+
+* execute shell commands,
+* SSH into hosts,
+* mutate production,
+* restart services,
+* apply remediations,
+* open pull requests,
+* change infrastructure,
+* bypass policy validation,
+* implement MCP in 1.0,
+* reuse ChatGPT or Codex subscription authentication as an LLM provider.
+
+Every tool call must be read-only, registered, policy-validated, and recorded in the trajectory.
 
 ## North Star
 
@@ -277,12 +326,12 @@ Vigil 1.0 must support these use cases.
 
 ### 1. Alert Investigation
 
-Given an alert file or alert source, generate an investigation brief.
+Given an alert selector or alert source, collect read-only context and generate an investigation brief.
 
 Example:
 
 ```bash
-vigil investigate --alert alert.yaml --inventory inventory.yaml
+vigil investigate alert WebHigh5xxRate --since 30m
 ```
 
 The result should answer:
@@ -297,12 +346,12 @@ The result should answer:
 
 ### 2. Target Investigation
 
-Given a service or host target, generate an operational investigation brief.
+Given a service or host target, collect read-only context and generate an operational investigation brief.
 
 Example:
 
 ```bash
-vigil investigate service:web --inventory inventory.yaml
+vigil investigate service:web --since 30m
 ```
 
 The result should answer:
@@ -341,7 +390,11 @@ The trajectory is not a chat log. It is structured operational memory.
 
 It should include:
 
-* input files,
+* input files or investigation selector,
+* configured sources,
+* registered capabilities,
+* planned read-only tool calls,
+* tool results,
 * resolved targets,
 * collected evidence,
 * LLM request metadata,
@@ -417,7 +470,7 @@ The implementation must keep an internal provider boundary so that additional pr
 
 ### Provider Responsibilities
 
-The Cloudflare provider receives an `EvidencePacket` and returns a `ReasoningResult`.
+The Cloudflare provider receives an `EvidencePacket` and returns schema-validated `ToolPlan` and `ReasoningResult` responses for planning and final reasoning.
 
 The provider must not:
 
@@ -493,26 +546,34 @@ Vigil must clearly distinguish:
 
 Hypotheses are not facts.
 
-Recommended checks are not executed by Vigil 1.0.
+LLM recommended checks are not executed directly. Vigil may convert them into registered read-only `ToolPlan` calls, validate them against policy, and execute only those read-only adapter calls.
 
 ## Data Flow
 
 The 1.0 investigation workflow is:
 
 ```text
-Case manifest / case evidence / file inputs / read-only adapters
+Target / alert / case / file inputs
         ↓
-Target resolution
+Target or alert resolution
         ↓
-Evidence collection
+Initial read-only context collection
         ↓
 EvidencePacket construction
         ↓
 Redaction / normalization
         ↓
-Cloudflare AI Gateway
+Cloudflare AI Gateway planning or deterministic planning
         ↓
-ReasoningResult
+ToolPlan
+        ↓
+Policy validation
+        ↓
+Registered read-only adapter calls
+        ↓
+ToolResult evidence
+        ↓
+ReasoningResult over expanded EvidencePacket
         ↓
 Schema validation
         ↓
@@ -640,6 +701,78 @@ operator_input
 external
 ```
 
+### Source
+
+Represents a configured read-only context source.
+
+Fields should include:
+
+```text
+id
+kind
+name
+read_only
+config
+```
+
+### Capability
+
+Represents a registered read-only operation exposed by a source.
+
+Fields should include:
+
+```text
+id
+kind
+source_id
+adapter
+read_only
+description
+input_schema
+risk
+```
+
+### ToolPlan
+
+Represents proposed read-only collection steps.
+
+Fields should include:
+
+```text
+id
+rationale
+calls
+```
+
+### ToolResult
+
+Represents the result of a policy-validated read-only adapter call.
+
+Fields should include:
+
+```text
+call_id
+capability_id
+source_id
+status
+started_at
+completed_at
+evidence
+error
+```
+
+### InvestigationBudget
+
+Represents loop limits.
+
+Fields should include:
+
+```text
+max_iterations
+max_tool_calls
+max_duration_secs
+```
+
 ### EvidencePacket
 
 The exact structured input sent to the LLM provider.
@@ -713,6 +846,7 @@ related_evidence_ids
 ```
 
 In 1.0, recommended checks are not executed.
+They may inform later `ToolPlan` proposals, but only registered read-only capabilities can be executed.
 
 ### EvidenceBrief
 
@@ -744,6 +878,9 @@ id
 started_at
 completed_at
 inputs
+sources
+capabilities
+investigation_loop
 resolved_targets
 evidence_packet
 reasoning_result
@@ -816,7 +953,25 @@ vigil runbook add web-5xx examples/minimal/runbooks/web-5xx.yaml
 
 Main command.
 
-Primary case behavior:
+Primary target behavior:
+
+```bash
+vigil investigate service:web --since 30m
+```
+
+Primary alert behavior:
+
+```bash
+vigil investigate alert WebHigh5xxRate --since 30m
+```
+
+Plan-only behavior:
+
+```bash
+vigil investigate service:web --since 30m --plan-only
+```
+
+Case compatibility behavior:
 
 ```bash
 vigil investigate web-5xx
@@ -847,10 +1002,17 @@ Options:
 --gateway-id <GATEWAY_ID>
 --dry-run
 --no-llm
-<CASE_DIR_OR_TARGET>
+--since <DURATION>
+--plan-only
+--source <SOURCE>
+--max-iterations <COUNT>
+--max-tool-calls <COUNT>
+--max-duration-secs <SECONDS>
+<TARGET_OR_CASE>
 ```
 
 `--no-llm` exists only for testing and deterministic rendering. It is not the primary assistant experience.
+`--plan-only` prints proposed read-only tool calls without executing adapters.
 
 #### `vigil config check`
 
@@ -899,6 +1061,7 @@ case evidence
 inventory
 alert
 runbook
+source fixtures
 ```
 
 Examples must be included under:
@@ -926,6 +1089,7 @@ JSON trajectory
 ```
 
 Case investigation writes these outputs under `<case>/output/` by default.
+Target and alert investigation write these outputs under `output/` by default.
 
 The Markdown brief must be readable without any external UI.
 
@@ -1015,6 +1179,9 @@ Responsibilities:
 
 * orchestrate investigation,
 * resolve targets,
+* register read-only sources and capabilities,
+* build and validate tool plans,
+* execute read-only adapter calls,
 * build evidence packets,
 * call LLM provider,
 * validate reasoning result,
@@ -1030,6 +1197,12 @@ Responsibilities:
 * define Target,
 * define Alert,
 * define Evidence,
+* define Source,
+* define Capability,
+* define ToolPlan,
+* define ToolResult,
+* define InvestigationLoop,
+* define InvestigationBudget,
 * define EvidencePacket,
 * define ReasoningResult,
 * define EvidenceBrief,
@@ -1109,6 +1282,10 @@ model serialization
 input parsing
 config loading
 EvidencePacket construction
+read-only capability registration
+ToolPlan policy validation
+fixture-backed adapter collection
+bounded investigation loop
 redaction
 ReasoningResult validation
 Markdown rendering
@@ -1302,6 +1479,12 @@ Deliver:
 
 * stable Rust CLI,
 * Cloudflare AI Gateway provider,
+* target-based investigation workflow,
+* alert-based investigation workflow,
+* bounded read-only investigation loop,
+* source and capability registry,
+* policy-validated tool planning,
+* fixture-backed or live read-only adapters for required 1.0 source types,
 * case-based input workflow,
 * file-based input workflow for compatibility,
 * LLM-assisted investigation brief,
@@ -1317,8 +1500,12 @@ Deliver:
 
 Vigil 1.0 is acceptable only when all of the following are true:
 
+* `vigil investigate service:web --since 30m` works.
+* `vigil investigate alert WebHigh5xxRate --since 30m` works.
+* `vigil investigate service:web --since 30m --plan-only` works.
 * `vigil investigate` works with a case directory.
 * `vigil investigate` works with the minimal file-based example.
+* Every agent tool call is read-only, registered, policy-validated, and recorded in the trajectory.
 * Cloudflare AI Gateway is the only implemented LLM provider.
 * LLM responses are schema-validated.
 * Invalid LLM responses are rejected or handled safely.
@@ -1356,15 +1543,15 @@ When implementing Vigil, follow these rules.
 
 ## Final Product Statement
 
-Vigil 1.0 is a Rust-based, Cloudflare-AI-Gateway-backed SRE investigation CLI.
+Vigil 1.0 is a Rust-based, Cloudflare-AI-Gateway-backed, read-only SRE investigation agent.
 
-It turns structured operational inputs into evidence-backed investigation briefs.
+It starts from a target or alert, collects bounded read-only context from configured sources, and turns the resulting evidence into investigation briefs.
 
 It helps operators understand incidents faster.
 
 It does not fix production automatically.
 
-It does not execute commands.
+It does not execute shell commands.
 
 It does not replace SRE judgment.
 
@@ -1374,139 +1561,86 @@ It provides a reliable foundation for future SRE AI tooling.
 
 Vigil 1.0 must be usable during an actual SRE investigation.
 
-The primary workflow is case-based investigation.
-
-A case is a local investigation workspace that contains the operational question,
-target, supplied evidence, related changes, runbooks, generated brief, and trajectory.
+The primary workflow is target- or alert-based read-only investigation.
 
 ### Primary Workflow
 
 ```text
-case init
-  -> evidence add
-  -> change add
-  -> runbook add
-  -> investigate
-  -> review brief
-  -> add more evidence
-  -> investigate again
+target or alert
+  -> resolve context from configured sources
+  -> plan read-only checks
+  -> validate the plan against registered capabilities
+  -> collect evidence through read-only adapters
+  -> update hypotheses
+  -> render brief, JSON, and trajectory
 ```
 
 ### Required User Experience
 
-An operator must be able to start from a real alert or symptom without hand-writing a complete EvidencePacket.
+An operator must be able to start from a real target, alert, or symptom without hand-writing a complete EvidencePacket.
 
 The user should be able to:
 
-1. Create an investigation case from a target, alert summary, and severity.
-2. Add metric, log, change, runbook, and operator-observation evidence.
-3. Run LLM-assisted investigation through Cloudflare AI Gateway.
-4. Receive a Markdown brief suitable for incident notes.
-5. Receive JSON output suitable for tooling.
-6. Receive a trajectory suitable for replay, debugging, and future evaluation.
-7. Re-run investigation after adding more evidence.
-8. Do all of the above without production mutation or command execution.
+1. Run target investigation with `vigil investigate service:web --since 30m`.
+2. Run alert investigation with `vigil investigate alert WebHigh5xxRate --since 30m`.
+3. Preview read-only collection with `--plan-only`.
+4. Configure local inventory and runbook sources.
+5. Configure read-only Alertmanager, Prometheus, GitHub, HTTP, DNS, Loki, Grafana, and Kubernetes sources.
+6. Run LLM-assisted investigation through Cloudflare AI Gateway.
+7. Receive a Markdown brief suitable for incident notes.
+8. Receive JSON output suitable for tooling.
+9. Receive a trajectory suitable for replay, debugging, and future evaluation.
+10. Use case and file workflows for scripting, tests, and manually curated evidence.
+11. Do all of the above without production mutation, shell execution, SSH, or remediation.
 
 ### Required Commands
 
 Vigil 1.0 should provide these user-facing commands:
 
 ```text
+vigil investigate
 vigil case init
 vigil evidence add
 vigil change add
 vigil runbook add
-vigil investigate
 vigil render
 vigil validate
 vigil config check
 vigil version
 ```
 
-### Case Directory
+### Agent Outputs
 
-A Vigil case directory should look like this:
+Target and alert investigation should write by default:
+
+```text
+output/brief.md
+output/brief.json
+output/trajectory.json
+```
+
+`--plan-only` should print planned read-only collection and should not collect evidence.
+
+### Case Compatibility
+
+A Vigil case directory remains supported:
 
 ```text
 web-5xx/
   vigil.yaml
   evidence/
-    metric-001.yaml
-    log-001.yaml
-    change-001.yaml
-    operator-note-001.yaml
   runbooks/
-    web-5xx.yaml
   output/
     brief.md
     brief.json
     trajectory.json
 ```
 
-### Case Manifest
+Case workflows are useful for manually curated evidence, regression tests, and scripted local investigations, but they are not the primary 1.0 UX.
 
-`vigil.yaml` should contain:
+### File Compatibility
 
-```yaml
-id: web-5xx
-title: Web 5xx investigation
-severity: page
-status: investigating
-target: service:web
-summary: Web service 5xx responses are above threshold.
-created_at: "2026-06-29T00:00:00Z"
-```
-
-### Evidence Add UX
-
-Users should not need to manually write full YAML for common evidence.
-
-Examples:
-
-```bash
-vigil evidence add web-5xx \
-  --kind metric \
-  --summary "HTTP 5xx rate increased from 0.2% to 8.4%" \
-  --source prometheus \
-  --url "https://grafana.example.com/d/web"
-```
-
-```bash
-vigil evidence add web-5xx \
-  --kind log \
-  --summary "Backend timeout errors increased around the alert window" \
-  --source loki \
-  --file ./timeout-snippet.txt
-```
-
-```bash
-vigil change add web-5xx \
-  --summary "Caddy upstream timeout setting changed before the alert" \
-  --source github \
-  --url "https://github.com/example/repo/pull/123"
-```
-
-### Investigation UX
-
-Users should be able to run:
-
-```bash
-vigil investigate web-5xx
-```
-
-By default, this should write:
-
-```text
-web-5xx/output/brief.md
-web-5xx/output/brief.json
-web-5xx/output/trajectory.json
-```
-
-Explicit output flags should remain supported.
-
-### Compatibility
-
-The existing file-based workflow should remain available for scripting:
+The file-based workflow should remain available for scripting:
 
 ```bash
 vigil investigate \
@@ -1516,11 +1650,9 @@ vigil investigate \
   --output brief.md
 ```
 
-However, the case-based workflow is the primary UX for 1.0.
-
 ### Non-Goals
 
-The case workflow must not introduce:
+The agent workflow must not introduce:
 
 * shell command execution,
 * SSH execution,
@@ -1528,4 +1660,5 @@ The case workflow must not introduce:
 * production mutation,
 * autonomous remediation,
 * ChatOps bot behavior,
+* MCP,
 * background monitoring.

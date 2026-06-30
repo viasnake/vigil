@@ -1,12 +1,37 @@
 # Vigil
 
-Vigil is a Rust CLI for producing evidence-backed SRE investigation briefs from local case workspaces and structured input files.
+Vigil is a Rust CLI for bounded read-only SRE investigation.
 
-The current implementation lets operators create a local case, add metric/log/change evidence and runbooks, build a redacted evidence packet, ask Cloudflare AI Gateway for structured reasoning, validate the response, and render Markdown, JSON, and trajectory output.
+The current implementation can start from a target or alert, plan registered read-only collection, collect file-backed/mock fixture evidence from configured sources, build a redacted evidence packet, ask Cloudflare AI Gateway for structured reasoning, validate the response, and render Markdown, JSON, and trajectory output.
 
 ## Quick Start
 
-Run a deterministic case investigation without Cloudflare credentials:
+Inspect a target investigation plan without Cloudflare credentials:
+
+```bash
+cargo run -p vigil-cli -- investigate service:web \
+  --since 30m \
+  --plan-only \
+  --no-llm
+```
+
+Run a deterministic target investigation:
+
+```bash
+cargo run -p vigil-cli -- investigate service:web \
+  --since 30m \
+  --no-llm
+```
+
+By default this writes:
+
+```text
+output/brief.md
+output/brief.json
+output/trajectory.json
+```
+
+Local case workspaces are still supported:
 
 ```bash
 cargo run -p vigil-cli -- case init /tmp/web-5xx \
@@ -69,7 +94,9 @@ See [docs/commands.md](docs/commands.md) for command details.
 
 ## Safety Boundary
 
-Vigil does not execute shell commands, SSH into hosts, run target-side agents, mutate production, or perform remediation. Recommended checks are rendered as advisory read-only descriptions only.
+Vigil does not execute shell commands, SSH into hosts, run target-side agents, mutate production, or perform remediation. Agent tool calls are limited to registered read-only capabilities and are recorded in the trajectory.
+
+Alertmanager, Prometheus, GitHub, HTTP, DNS, Loki, Grafana, and Kubernetes adapters are read-only. Network-backed adapters use configured URLs only; fixtures remain supported for tests and local dry runs.
 
 ## Documentation
 
